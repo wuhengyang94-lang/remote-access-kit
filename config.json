@@ -1,0 +1,14 @@
+{
+  "authKey": "",
+  "opsUser": "zcode_ops",
+  "opsPassword": "",
+  "siteName": "",
+  "jumpHost": "",
+  "targetServer": "",
+  "dbPort": 13306,
+  "webPort": 18080,
+  "rdpPort": 13389,
+  "extraForwards": [],
+  "advertiseRoutes": [],
+  "profilePath": ""
+}

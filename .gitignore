@@ -1,0 +1,6 @@
+# Local lab evidence, filled secrets, and generated profiles must never be committed.
+lab/
+config.local.json
+*.local.json
+profile-*.txt
+*.log
