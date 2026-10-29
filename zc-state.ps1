@@ -516,6 +516,25 @@ function Invoke-ZcUndoJournal {
                     }
                 }
             }
+            'registry.tailscale-env' {
+                $path = [string]$d.Path
+                $name = [string]$d.Name
+                $cur = Get-ZcRegState -Path $path -Name $name
+                $curText = (@($cur.Value) -join "`n")
+                $setText = (@($d.ValueSet) -join "`n")
+                if ($cur.Exists -and $curText -ne $setText) {
+                    [void]$results.Add((New-ZcUndoResult $kind $name 'restore registry' 'Error' 'current value differs; not restored'))
+                } elseif ($DryRun) {
+                    [void]$results.Add((New-ZcUndoResult $kind $name 'restore registry' 'Planned' ''))
+                } else {
+                    try {
+                        Set-ZcRegState -Path $path -Name $name -Value $d.ValueBefore -Exists ([bool]$d.ExistedBefore)
+                        [void]$results.Add((New-ZcUndoResult $kind $name 'restore registry' 'Restored' ''))
+                    } catch {
+                        [void]$results.Add((New-ZcUndoResult $kind $name 'restore registry' 'Error' $_.Exception.Message))
+                    }
+                }
+            }
             'tailscale.install' {
                 if (-not $RemoveTailscale) {
                     [void]$results.Add((New-ZcUndoResult $kind 'Tailscale' 'none' 'Skipped' 'install kept; use -RemoveTailscale to uninstall'))

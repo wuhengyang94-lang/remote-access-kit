@@ -1,6 +1,6 @@
 # 现场远程接入工具包 — 安全加固原型
 
-> **状态（2026-10-23）：现场链路只读回归通过；01/02 已加入变更日志、签名校验、凭据传递加固和 03 撤销机制；UAC 提权+同意+执行已在 Server 2019 Desktop 上自动化验证通过。仍不是已完成全场景安全验收的稳定版。**
+> **状态（2026-10-27）：现场链路只读回归通过；01/02 已加入变更日志、签名校验、凭据传递加固和 03 撤销机制；UAC 提权+同意+执行已在 Server 2019 Desktop 上自动化验证通过；已按现场复盘加固 TLS 握手重置与 MSI 安装判定。仍不是已完成全场景安全验收的稳定版。**
 > 底层借用 Tailscale，目标是现场和本机各运行一次。现场初始化默认暂停；不得在生产跳板机反复试跑初始化或修改转发来验证工具。
 > 分发配置是空模板，不含实际口令、auth key、项目地址或测试结果。
 
@@ -30,12 +30,17 @@
   - 以旧跳板 VM 为跳板，02 创建 4 条映射（13306/18080/13389 + 28081→127.0.0.1:5985），写 8 条 connect journal 变更和本机 TrustedHosts/profile journal；28081 TCP 实测 OPEN。
   - 03 Site 删除 4 条 portproxy + 4 条防火墙规则（按 netsh 规则的 DisplayName 查找、按真实 Rule Name 删除），原有 `ZCode-WinRM-Tailscale` 保留；03 Local 恢复 TrustedHosts、删除 profile；Site/Local journal 均 `Undone`，12/12 检查通过。
   - 本轮测试使用 `-Target 172.21.64.1 -NoVerify`（该目标仅 3306 开放）；28081 的 TCP 已实测，Web/MySQL/RDP 的端到端验证仍需真实目标。
-- 离线测试：26 项转发 + 8 项菜单/参数/失败传播 + 32 项状态/撤销 + 4 项 Join-Tailnet 兜底，共 70 项通过。测试不执行真实安装或访问生产。
+- 离线测试：26 项转发 + 8 项菜单/参数/失败传播 + 35 项状态/撤销 + 12 项 01（Join-Tailnet 重试 + 安装判定），共 81 项通过。测试不执行真实安装或访问生产。
 - 2026-10-23 UAC/安全基线自动化验证（在保留的 2019 Desktop 机 `zcode-kit-2019d` 上，无人工点击）：
   - **完整闭环通过**：`Msvm_Keyboard` 注入 `Win+R` → `uac-launch.cmd`（`Start-Process -Verb RunAs`），PowerShell Direct 检测到 `consent.exe`（证明真实弹出 UAC 同意框），`Alt+Y` 批准后 01 以管理员运行并**成功入网**（`100.67.69.46`，`[ ok ] tailnet joined.`），随后 03 全量撤销（logout、MSI 卸载、账号/规则/注册表/access-result 回退）；`01Exit=0`、`03Exit=0`、journal `Undone`、Tailscale 已卸载、`zcode_ops` 已删。
-  - 首轮 Tailscale 在 `TS_AUTHKEY` 路径回退到交互登录（后台确认旧 key 实为可复用且有效，非过期/消耗），01 正确回滚；换新 key、停 IPN 后用**显式 `--authkey` 兜底**才通过。说明 env-key 路径可能静默转交互、`--authkey` 更可靠。**已加固**：01 现在把 `To authenticate, visit:` 也纳入兜底重试条件，env-key 静默转交互时会自动改走 `--authkey`（离线测试 4 项覆盖）。测试壳已改为读取 `uac-01.exit`（01 真实退出码）。
+  - 首轮 Tailscale 在 `TS_AUTHKEY` 路径回退到交互登录（后台确认旧 key 实为可复用且有效，非过期/消耗），01 正确回滚；换新 key、停 IPN 后用**显式 `--authkey` 兜底**才通过。说明 env-key 路径可能静默转交互、`--authkey` 更可靠。**已加固**：01 现在把 `To authenticate, visit:` 也纳入兜底重试条件，env-key 静默转交互时会自动改走 `--authkey`（离线测试覆盖）。测试壳已改为读取 `uac-01.exit`（01 真实退出码）。
   - 关键排障：`Set-VM -EnhancedSessionTransportType HvSocket` 是**开启**增强会话（会弹「显示配置」对话框挡住合成键盘），`VMBus` 才是基本会话；此前写反导致自动化卡住。
   - 测试后清理：删 `uac_admin`、关闭自动登录、config.json 复位为空模板、删测试产物与桌面快捷方式、删本地 authkey/凭据文件、VM 关机；UAC 注册表回到基线。证据见 `lab\helper49.log`、`lab\uac2-01.log`、`lab\uac2-03.log`、`lab\status-52/53.json`。
+- 2026-10-27 按现场复盘加固：
+  - **控制面 TLS 握手被重置**（`BackendState=NeedsLogin` + `fetch control key`/`wsarecv`，但 curl 同地址返回 200）：01 自动给 Tailscale 服务设 `GODEBUG=tlsmlkem=0`、重启服务并重试；变更写 `registry.tailscale-env` journal，03 精确回退。
+  - **MSI 安装判定**：不再只看退出码（部分机器返回空）；以安装产品/服务存在 + MSI 日志 `MainEngineThread is returning 0` 判定（`Test-ZcTailscaleInstall`）。
+  - 无内置安装包时改用 `curl.exe --retry` 下载 + 大小/签名校验；join 失败输出 `BackendState/Health`。
+  - **真机回归未做**（无可复用 VM/ISO）。
 
 **未验证：**
 - 客户现场实际的 Windows Server 2019 定制镜像（评估版 Desktop/Core 均已通过）、完整现场安全基线、重启恢复；评估版上的真实 UAC 双击完整闭环已通过。
@@ -167,7 +172,7 @@
 1. 预先存在的宽 WinRM 规则仍可能保留；现场若不允许，需要甲方单独审批后手工收紧。
 2. 已有账号被 `-AllowExistingAccountUpdate` 改密后，旧密码无法恢复；默认拒绝改已有账号。
 3. `config.json` 不自动回滚；本机安装的 Tailscale 不自动卸载；Tailscale 节点和 auth key 需管理后台手工吊销。
-4. 尚未在 Server 2019 和真实全新机器上完成“加固后完整 01 + 03”复验。
+4. 客户现场实际定制镜像的“加固后完整 01 + 03”复验仍未做（评估版 2019 Desktop/Core 已通过）。
 5. 安全基线（磁盘加密、日志审计、最小权限、凭据轮换、节点审批）仍需按现场制度补齐。
 
 ## 离线测试
@@ -176,9 +181,10 @@
 .\tests\Forwarding.Tests.ps1
 .\tests\Launcher.Tests.ps1
 .\tests\State.Tests.ps1
+.\tests\JoinRetry.Tests.ps1
 ```
 
-三组共 66 项，均不连接现场、不执行真实安装。`State.Tests.ps1` 覆盖 journal 往返、归属判断、变更资源拒绝删除、只删本 run 防火墙、DryRun 零写入、02 connect journal 写入、netsh 规则 DisplayName 回退和源码安全约束。
+四组共 81 项，均不连接现场、不执行真实安装。`State.Tests.ps1` 覆盖 journal 往返、归属判断、变更资源拒绝删除、只删本 run 防火墙、DryRun 零写入、02 connect journal 写入、netsh 规则 DisplayName 回退、`registry.tailscale-env` 回退和源码安全约束；`JoinRetry.Tests.ps1` 覆盖 Join-Tailnet 的交互回退/`--authkey`/TLS-reset 兜底与 MSI 安装结果判定。
 
 ## 关于“零操作”
 

@@ -204,6 +204,68 @@ function Wait-TailscaleReady([int]$TimeoutSec = 90) {
     return $false
 }
 
+function Get-TailscaleHealth {
+    $r = Invoke-Ts @('status', '--json') -TimeoutSec 30
+    if ($r.ExitCode -ne 0 -or -not $r.Text) { return $null }
+    try { $j = $r.Text | ConvertFrom-Json } catch { return $null }
+    $health = (@($j.Health) -join '; ')
+    $reset = ($health -match 'Unable to connect to the Tailscale coordination server|Unable to connect to the coordination server|fetch control key|wsarecv|connection reset|reset by peer')
+    return [pscustomobject]@{
+        BackendState = [string]$j.BackendState
+        Health = $health
+        ControlPlaneTlsReset = [bool]$reset
+    }
+}
+
+function Enable-TailscaleTlsMlkemWorkaround {
+    # Some on-site networks/security appliances reset Tailscale's Go TLS
+    # handshake (the post-quantum ML-KEM ClientHello is large) while plain
+    # curl/SChannel to the same host succeeds. Disable ML-KEM for the service
+    # only; the setting must persist for the node to stay connectable.
+    $svcKey = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tailscale'
+    $before = Get-ZcRegState -Path $svcKey -Name 'Environment'
+    $beforeLines = @()
+    if ($before.Exists -and $null -ne $before.Value) {
+        $beforeLines = @($before.Value | ForEach-Object { [string]$_ })
+    }
+    $lines = @($beforeLines)
+    $changed = $false
+    $idx = -1
+    for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i] -match '^GODEBUG=') { $idx = $i; break } }
+    if ($idx -ge 0) {
+        $val = $lines[$idx].Substring(8)
+        if ($val -notmatch '(^|,)tlsmlkem=0(,|$)') {
+            $lines[$idx] = 'GODEBUG=' + $(if ($val) { $val + ',tlsmlkem=0' } else { 'tlsmlkem=0' })
+            $changed = $true
+        }
+    } else {
+        $lines += 'GODEBUG=tlsmlkem=0'
+        $changed = $true
+    }
+    if ($changed) {
+        New-ItemProperty -Path $svcKey -Name 'Environment' -PropertyType MultiString -Value ([string[]]$lines) -Force | Out-Null
+        Add-SiteChange 'registry.tailscale-env' @{
+            Path = $svcKey
+            Name = 'Environment'
+            ExistedBefore = [bool]$before.Exists
+            ValueBefore = @($beforeLines)
+            ValueSet = @($lines)
+        }
+    }
+    Write-Warn2 'control-plane TLS handshake is being reset; set Tailscale service GODEBUG=tlsmlkem=0 and restarted the service.'
+    Restart-Service -Name 'Tailscale' -Force -ErrorAction SilentlyContinue
+    [void](Wait-TailscaleReady -TimeoutSec 120)
+}
+
+function Test-ZcTailscaleInstall {
+    param([object]$ExitCode, [bool]$Installed, [bool]$LogOk)
+    if (-not $Installed) { return [pscustomobject]@{ Ok = $false; Reason = 'product not found after install' } }
+    if ($null -ne $ExitCode -and ([int]$ExitCode -notin 0, 3010) -and -not $LogOk) {
+        return [pscustomobject]@{ Ok = $false; Reason = "installer exit code $ExitCode" }
+    }
+    return [pscustomobject]@{ Ok = $true; Reason = '' }
+}
+
 function Install-Tailscale {
     if (Test-Path -LiteralPath $script:TsExe) {
         Write-Ok "Tailscale already installed: $script:TsExe"
@@ -230,21 +292,46 @@ function Install-Tailscale {
         }
     }
     if (-not $localInstaller) {
-        $localInstaller = Join-Path $script:RunDir ('tailscale-setup-latest-' + [guid]::NewGuid().ToString('N') + '.exe')
-        Write-Step 'downloading Tailscale installer...'
-        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-        Invoke-WebRequest -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe' -OutFile $localInstaller -UseBasicParsing
+        $localInstaller = Join-Path $script:RunDir ('tailscale-setup-' + [guid]::NewGuid().ToString('N') + '.exe')
+        Write-Step 'downloading Tailscale installer (curl, retry)...'
+        $curl = Get-Command 'curl.exe' -ErrorAction SilentlyContinue
+        if ($curl) {
+            $dl = & curl.exe -L --retry 3 --retry-delay 2 -s -S -o $localInstaller 'https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe' 2>&1
+            if ($LASTEXITCODE -ne 0) { throw "Tailscale download failed (curl exit $LASTEXITCODE): $dl" }
+        } else {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            Invoke-WebRequest -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe' -OutFile $localInstaller -UseBasicParsing
+        }
+        if (-not (Test-Path -LiteralPath $localInstaller) -or (Get-Item -LiteralPath $localInstaller).Length -lt 500KB) {
+            throw 'downloaded Tailscale installer looks truncated or missing.'
+        }
     }
     Assert-InstallerTrusted $localInstaller
 
     Write-Step 'installing Tailscale (silent)...'
+    $msiLog = Join-Path $script:RunDir 'tailscale-msi.log'
     if ($localInstaller -match '\.msi$') {
-        $proc = Start-Process -FilePath 'msiexec.exe' -ArgumentList @('/i', ('"{0}"' -f $localInstaller), '/quiet', '/norestart') -Wait -PassThru
-        if ($proc.ExitCode -notin 0, 3010) { throw "Tailscale MSI exited with code $($proc.ExitCode)." }
+        $proc = Start-Process -FilePath 'msiexec.exe' -ArgumentList @('/i', ('"{0}"' -f $localInstaller), '/quiet', '/norestart', '/l*v', ('"{0}"' -f $msiLog)) -Wait -PassThru
     } else {
         $proc = Start-Process -FilePath $localInstaller -ArgumentList '/quiet' -Wait -PassThru
-        if ($proc.ExitCode -ne 0) { throw "Tailscale installer exited with code $($proc.ExitCode)." }
     }
+    $exitCode = $proc.ExitCode
+    # A successful install may still return a null exit code on some hosts.
+    # Confirm by product/exe presence and the MSI log instead of the code alone.
+    $installed = $false
+    for ($i = 0; $i -lt 20; $i++) {
+        if (Test-Path -LiteralPath $script:TsExe) { $installed = $true; break }
+        if (Get-ZcTailscaleProductState) { $installed = $true; break }
+        Start-Sleep -Seconds 1
+    }
+    $logOk = $false
+    if (Test-Path -LiteralPath $msiLog) {
+        $logTail = @(Get-Content -LiteralPath $msiLog -Tail 300 -ErrorAction SilentlyContinue)
+        if (@($logTail | Where-Object { $_ -match 'MainEngineThread is returning 0' }).Count -gt 0) { $logOk = $true }
+    }
+    $verdict = Test-ZcTailscaleInstall -ExitCode $exitCode -Installed $installed -LogOk $logOk
+    if (-not $verdict.Ok) { throw "Tailscale install failed: $($verdict.Reason) (exit code: $exitCode; log: $msiLog)." }
+    if ($null -eq $exitCode) { Write-Warn2 'installer exit code was unavailable; product presence confirmed, continuing.' }
     $product = $null
     for ($i = 0; $i -lt 10; $i++) {
         $product = Get-ZcTailscaleProductState
@@ -432,6 +519,18 @@ function Join-Tailnet([string]$Key, [string[]]$Routes) {
             Stop-TailscaleIpn
             $r = Invoke-Ts ($tailArgs + @('--authkey', $Key)) -TimeoutSec 90
         }
+        # Some on-site networks/security appliances reset Tailscale's own TLS
+        # handshake while plain curl to the same host succeeds. Detect that via
+        # status --json and apply the service-level ML-KEM workaround.
+        if ($r.ExitCode -ne 0) {
+            $health = Get-TailscaleHealth
+            if ($health -and $health.ControlPlaneTlsReset) {
+                Write-Warn2 ("Tailscale cannot reach the coordination server (BackendState=" + $health.BackendState + "); this is a network TLS reset, not a bad key.")
+                Enable-TailscaleTlsMlkemWorkaround
+                Stop-TailscaleIpn
+                $r = Invoke-Ts ($tailArgs + @('--authkey', $Key)) -TimeoutSec 90
+            }
+        }
         if ($r.ExitCode -ne 0 -and $r.Text -match $retryPattern) {
             Write-Warn2 'still failing; retrying as SYSTEM...'
             $sysOut = Invoke-TailscaleAsSystem -TailArgs $tailArgs -AuthKey $Key -TimeoutSec 120
@@ -439,6 +538,8 @@ function Join-Tailnet([string]$Key, [string[]]$Routes) {
             Write-Ok 'tailnet joined (via SYSTEM).'
         } elseif ($r.ExitCode -ne 0) {
             if ($r.Text) { Write-Host "      $($r.Text)" }
+            $health = Get-TailscaleHealth
+            if ($health) { Write-Host ("      BackendState=" + $health.BackendState + "; Health=" + $health.Health) }
             throw "tailscale up failed (exit $($r.ExitCode)). Check auth key expiry / reuse policy and internet access."
         } else {
             Write-Ok 'tailnet joined.'

@@ -124,6 +124,40 @@ $tsKinds = @($tsPlan.Results | ForEach-Object { [string]$_.Kind })
 Assert-True ($tsKinds.IndexOf('tailscale.join') -lt $tsKinds.IndexOf('tailscale.install')) 'Tailscale logout must be planned before uninstall.'
 $pass++
 
+# --- registry.tailscale-env restore (mocked registry; never touches the real service) ---
+$script:Reg = @{ 'HKLM:\TEST\Tailscale' = @{ Environment = @('GODEBUG=tlsmlkem=0') } }
+function Get-ZcRegState {
+    param([string]$Path, [string]$Name)
+    if ($script:Reg.ContainsKey($Path) -and $script:Reg[$Path].ContainsKey($Name)) {
+        return [pscustomobject]@{ Exists = $true; Value = $script:Reg[$Path][$Name] }
+    }
+    return [pscustomobject]@{ Exists = $false; Value = $null }
+}
+function Set-ZcRegState {
+    param([string]$Path, [string]$Name, $Value, [bool]$Exists)
+    if ($Exists) {
+        if (-not $script:Reg.ContainsKey($Path)) { $script:Reg[$Path] = @{} }
+        $script:Reg[$Path][$Name] = $Value
+    } else {
+        if ($script:Reg.ContainsKey($Path)) { $script:Reg[$Path].Remove($Name) }
+    }
+}
+$envJournal = [pscustomobject]@{
+    Schema = 1; Tool = 'zcode-remote-access-kit'; RunId = 'site-env-test'; Phase = 'site'
+    HostName = $env:COMPUTERNAME; SiteName = 'lab'; CreatedUtc = (Get-Date).ToUniversalTime().ToString('o')
+    UpdatedUtc = (Get-Date).ToUniversalTime().ToString('o'); Status = 'Applied'; Snapshot = [pscustomobject]@{}
+    Changes = @(
+        [pscustomobject]@{ Kind = 'registry.tailscale-env'; Data = [pscustomobject]@{ Path = 'HKLM:\TEST\Tailscale'; Name = 'Environment'; ExistedBefore = $false; ValueBefore = @(); ValueSet = @('GODEBUG=tlsmlkem=0') } }
+    )
+    UndoResults = @()
+}
+$envDry = Invoke-ZcUndoJournal -Root $state -Journal $envJournal -DryRun
+Assert-True (@($envDry.Results | Where-Object { $_.Kind -eq 'registry.tailscale-env' -and $_.Status -eq 'Planned' }).Count -eq 1) 'GODEBUG env change must be planned for restore.'
+$envActual = Invoke-ZcUndoJournal -Root $state -Journal $envJournal
+Assert-True (@($envActual.Results | Where-Object { $_.Kind -eq 'registry.tailscale-env' -and $_.Status -eq 'Restored' }).Count -eq 1) 'GODEBUG env change must be restored.'
+Assert-True (-not $script:Reg['HKLM:\TEST\Tailscale'].ContainsKey('Environment')) 'Environment must be removed when it did not exist before.'
+$pass += 3
+
 # --- 02 connect journal (remote body with mocks) ---
 $s02path = Join-Path $root '02-connect-site.ps1'
 $tokens = $null; $parseErrors = $null
