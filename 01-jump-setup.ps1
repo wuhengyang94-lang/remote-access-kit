@@ -51,6 +51,7 @@ param(
     [switch]$AllowExistingAccountUpdate,
     [switch]$AllowBroadWinRM,
     [switch]$NoRollbackOnFailure,
+    [switch]$UseOnlineInstaller,
     [string]$StateRoot
 )
 
@@ -76,6 +77,7 @@ $script:StateRoot = ''
 $script:RunDir = ''
 $script:RunId = ''
 $script:WinRmBroadRulesRemaining = @()
+$script:UseOnlineInstaller = [bool]$UseOnlineInstaller
 
 function Write-Step([string]$Text) { Write-Host "[step] $Text" -ForegroundColor Cyan }
 function Write-Ok([string]$Text)   { Write-Host "[ ok ] $Text" -ForegroundColor Green }
@@ -272,7 +274,9 @@ function Install-Tailscale {
         return
     }
     $localInstaller = $InstallerPath
-    if (-not $localInstaller -and (Test-Path -LiteralPath $script:ToolDir)) {
+    if (-not $localInstaller -and $script:UseOnlineInstaller) {
+        Write-Step 'online installer requested; ignoring the bundled package.'
+    } elseif (-not $localInstaller -and (Test-Path -LiteralPath $script:ToolDir)) {
         $full = @(Get-ChildItem -LiteralPath $script:ToolDir -Filter 'tailscale-setup*full*.exe' -ErrorAction SilentlyContinue)
         if ($full.Count -gt 0) {
             $localInstaller = $full[0].FullName

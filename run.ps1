@@ -11,7 +11,8 @@
 param(
     [ValidateSet(0,1,2)][int]$Mode = 0,
     [switch]$VerifyOnly,
-    [switch]$AllowExperimentalSiteSetup
+    [switch]$AllowExperimentalSiteSetup,
+    [switch]$OnlineInstaller
 )
 $ErrorActionPreference = 'Stop'
 try { [Console]::OutputEncoding = New-Object Text.UTF8Encoding($false) } catch { }
@@ -61,6 +62,7 @@ try {
             AdvertiseRoutes = [string[]]@($cfg.advertiseRoutes)
             AllowExperimentalSiteSetup = $true
         }
+        if ($OnlineInstaller -or [bool]$cfg.useOnlineInstaller) { $parameters['UseOnlineInstaller'] = $true }
         $global:LASTEXITCODE = 0
         & (Join-Path $root '01-jump-setup.ps1') @parameters
         $engineExit = $LASTEXITCODE

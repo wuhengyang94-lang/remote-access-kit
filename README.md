@@ -30,7 +30,7 @@
   - 以旧跳板 VM 为跳板，02 创建 4 条映射（13306/18080/13389 + 28081→127.0.0.1:5985），写 8 条 connect journal 变更和本机 TrustedHosts/profile journal；28081 TCP 实测 OPEN。
   - 03 Site 删除 4 条 portproxy + 4 条防火墙规则（按 netsh 规则的 DisplayName 查找、按真实 Rule Name 删除），原有 `ZCode-WinRM-Tailscale` 保留；03 Local 恢复 TrustedHosts、删除 profile；Site/Local journal 均 `Undone`，12/12 检查通过。
   - 本轮测试使用 `-Target 172.21.64.1 -NoVerify`（该目标仅 3306 开放）；28081 的 TCP 已实测，Web/MySQL/RDP 的端到端验证仍需真实目标。
-- 离线测试：26 项转发 + 8 项菜单/参数/失败传播 + 35 项状态/撤销 + 12 项 01（Join-Tailnet 重试 + 安装判定），共 81 项通过。测试不执行真实安装或访问生产。
+- 离线测试：26 项转发 + 10 项菜单/参数/失败传播 + 35 项状态/撤销 + 12 项 01（Join-Tailnet 重试 + 安装判定），共 83 项通过。测试不执行真实安装或访问生产。
 - 2026-10-23 UAC/安全基线自动化验证（在保留的 2019 Desktop 机 `zcode-kit-2019d` 上，无人工点击）：
   - **完整闭环通过**：`Msvm_Keyboard` 注入 `Win+R` → `uac-launch.cmd`（`Start-Process -Verb RunAs`），PowerShell Direct 检测到 `consent.exe`（证明真实弹出 UAC 同意框），`Alt+Y` 批准后 01 以管理员运行并**成功入网**（`100.67.69.46`，`[ ok ] tailnet joined.`），随后 03 全量撤销（logout、MSI 卸载、账号/规则/注册表/access-result 回退）；`01Exit=0`、`03Exit=0`、journal `Undone`、Tailscale 已卸载、`zcode_ops` 已删。
   - 首轮 Tailscale 在 `TS_AUTHKEY` 路径回退到交互登录（后台确认旧 key 实为可复用且有效，非过期/消耗），01 正确回滚；换新 key、停 IPN 后用**显式 `--authkey` 兜底**才通过。说明 env-key 路径可能静默转交互、`--authkey` 更可靠。**已加固**：01 现在把 `To authenticate, visit:` 也纳入兜底重试条件，env-key 静默转交互时会自动改走 `--authkey`（离线测试覆盖）。测试壳已改为读取 `uac-01.exit`（01 真实退出码）。
@@ -56,7 +56,7 @@
 
 - `start.cmd`：菜单 `[1] 现场初始化 / [2] 本机连接`。
 - `config.json`：运行前填入实际信息，视为密码文件保管。
-- `01-jump-setup.ps1`：现场引擎，默认拒绝执行。只有隔离测试机可显式使用 `-AllowExperimentalSiteSetup`。新增 `-SkipSignatureCheck`、`-AllowExistingAccountUpdate`、`-AllowBroadWinRM`、`-NoRollbackOnFailure` 等显式开关。
+- `01-jump-setup.ps1`：现场引擎，默认拒绝执行。只有隔离测试机可显式使用 `-AllowExperimentalSiteSetup`。新增 `-SkipSignatureCheck`、`-AllowExistingAccountUpdate`、`-AllowBroadWinRM`、`-NoRollbackOnFailure` 等显式开关；加 `-UseOnlineInstaller`（或 config `useOnlineInstaller: true`）改为在线下载官方安装包，不再使用内置 MSI（安装时需能访问 `pkgs.tailscale.com`）。
 - `02-connect-site.ps1`：本机引擎；相同转发不写入；冲突直接失败；新建规则写入 connect journal；不再自动重启 IP Helper。
 - `zc-state.ps1`：共享变更日志/撤销库；01/02/03 必须与它放在同一目录。
 - `03-undo.ps1`：按 journal 撤销；支持 `-List / -DryRun / -RunId / -Latest / -All / -Scope Site|Local|All`。
@@ -145,6 +145,7 @@
   "rdpPort": 13389,
   "extraForwards": [],
   "advertiseRoutes": [],
+  "useOnlineInstaller": false,
   "profilePath": ""
 }
 ```
@@ -155,6 +156,7 @@
 - `extraForwards` 是字符串数组，例如 `["23389:10.4.76.200:3389", "33389:10.4.76.30:3389"]`。
 - `profilePath` 为空时生成工具目录下的项目档案；只读模式不生成文件。
 - `authKey/advertiseRoutes` 仅用于现场实验模式。已有节点连接不需要重新输入 auth key。
+- `useOnlineInstaller: true`（或运行 `run.ps1 -Mode 1 -OnlineInstaller`）改为在线下载 Tailscale 官方安装包（带签名校验），不再用内置 MSI；适用于想用最新版或分发时不想带 37MB 安装包的场景。安装时需能访问 `pkgs.tailscale.com`。
 
 ## 安全加固现状与剩余项
 
@@ -184,7 +186,7 @@
 .\tests\JoinRetry.Tests.ps1
 ```
 
-四组共 81 项，均不连接现场、不执行真实安装。`State.Tests.ps1` 覆盖 journal 往返、归属判断、变更资源拒绝删除、只删本 run 防火墙、DryRun 零写入、02 connect journal 写入、netsh 规则 DisplayName 回退、`registry.tailscale-env` 回退和源码安全约束；`JoinRetry.Tests.ps1` 覆盖 Join-Tailnet 的交互回退/`--authkey`/TLS-reset 兜底与 MSI 安装结果判定。
+四组共 83 项，均不连接现场、不执行真实安装。`State.Tests.ps1` 覆盖 journal 往返、归属判断、变更资源拒绝删除、只删本 run 防火墙、DryRun 零写入、02 connect journal 写入、netsh 规则 DisplayName 回退、`registry.tailscale-env` 回退和源码安全约束；`JoinRetry.Tests.ps1` 覆盖 Join-Tailnet 的交互回退/`--authkey`/TLS-reset 兜底与 MSI 安装结果判定。
 
 ## 关于“零操作”
 

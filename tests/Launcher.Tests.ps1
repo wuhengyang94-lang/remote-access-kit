@@ -50,8 +50,26 @@ $PSBoundParameters | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $PSScriptR
     Invoke-Case '-Mode 2 -VerifyOnly' $false; $passed++
     [IO.File]::WriteAllText((Join-Path $sandbox 'site-profile-offline.md'), 'stale profile', $utf8)
     Invoke-Case '-Mode 2' $false; $passed++
-    [IO.File]::WriteAllText((Join-Path $sandbox '01-jump-setup.ps1'), 'exit 9', $utf8)
+    # The online installer option must reach the site engine (config or switch).
+    $stub01 = @'
+param([string]$AuthKey,[string]$OpsUser,[string]$OpsPassword,[string]$SiteName,
+[string[]]$AdvertiseRoutes,[switch]$AllowExperimentalSiteSetup,[switch]$UseOnlineInstaller)
+$PSBoundParameters | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $PSScriptRoot 'received01.json') -Encoding UTF8
+'@
+    $cfg.useOnlineInstaller = $true; Save-Config
+    [IO.File]::WriteAllText((Join-Path $sandbox '01-jump-setup.ps1'), $stub01, $utf8)
     [IO.File]::WriteAllText((Join-Path $sandbox 'access-result.txt'), 'JumpHost=100.64.0.10', $utf8)
+    Invoke-Case '-Mode 1 -AllowExperimentalSiteSetup' $true
+    $received01 = Get-Content (Join-Path $sandbox 'received01.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+    if (-not $received01.UseOnlineInstaller) { throw 'useOnlineInstaller from config did not reach the site engine.' }
+    $passed++
+    $cfg.useOnlineInstaller = $false; Save-Config
+    Remove-Item (Join-Path $sandbox 'received01.json') -Force -ErrorAction SilentlyContinue
+    Invoke-Case '-Mode 1 -AllowExperimentalSiteSetup -OnlineInstaller' $true
+    $received01 = Get-Content (Join-Path $sandbox 'received01.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+    if (-not $received01.UseOnlineInstaller) { throw 'the -OnlineInstaller switch did not reach the site engine.' }
+    $passed++
+    [IO.File]::WriteAllText((Join-Path $sandbox '01-jump-setup.ps1'), 'exit 9', $utf8)
     Invoke-Case '-Mode 1 -AllowExperimentalSiteSetup' $false; $passed++
     Write-Output "PASS: $passed offline launcher checks (stub engines; no remote access)."
 } finally {

@@ -10,5 +10,6 @@
   "rdpPort": 13389,
   "extraForwards": [],
   "advertiseRoutes": [],
+  "useOnlineInstaller": false,
   "profilePath": ""
 }
