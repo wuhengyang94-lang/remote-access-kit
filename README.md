@@ -30,17 +30,18 @@
   - 以旧跳板 VM 为跳板，02 创建 4 条映射（13306/18080/13389 + 28081→127.0.0.1:5985），写 8 条 connect journal 变更和本机 TrustedHosts/profile journal；28081 TCP 实测 OPEN。
   - 03 Site 删除 4 条 portproxy + 4 条防火墙规则（按 netsh 规则的 DisplayName 查找、按真实 Rule Name 删除），原有 `ZCode-WinRM-Tailscale` 保留；03 Local 恢复 TrustedHosts、删除 profile；Site/Local journal 均 `Undone`，12/12 检查通过。
   - 本轮测试使用 `-Target 172.21.64.1 -NoVerify`（该目标仅 3306 开放）；28081 的 TCP 已实测，Web/MySQL/RDP 的端到端验证仍需真实目标。
-- 离线测试：26 项转发 + 10 项菜单/参数/失败传播 + 35 项状态/撤销 + 12 项 01（Join-Tailnet 重试 + 安装判定），共 83 项通过。测试不执行真实安装或访问生产。
+- 离线测试：26 项转发 + 11 项菜单/参数/GUI 检查 + 35 项状态/撤销 + 12 项 01（Join-Tailnet 重试 + 安装判定），共 84 项通过。测试不执行真实安装或访问生产。
 - 2026-10-23 UAC/安全基线自动化验证（在保留的 2019 Desktop 机 `zcode-kit-2019d` 上，无人工点击）：
   - **完整闭环通过**：`Msvm_Keyboard` 注入 `Win+R` → `uac-launch.cmd`（`Start-Process -Verb RunAs`），PowerShell Direct 检测到 `consent.exe`（证明真实弹出 UAC 同意框），`Alt+Y` 批准后 01 以管理员运行并**成功入网**（`100.67.69.46`，`[ ok ] tailnet joined.`），随后 03 全量撤销（logout、MSI 卸载、账号/规则/注册表/access-result 回退）；`01Exit=0`、`03Exit=0`、journal `Undone`、Tailscale 已卸载、`zcode_ops` 已删。
   - 首轮 Tailscale 在 `TS_AUTHKEY` 路径回退到交互登录（后台确认旧 key 实为可复用且有效，非过期/消耗），01 正确回滚；换新 key、停 IPN 后用**显式 `--authkey` 兜底**才通过。说明 env-key 路径可能静默转交互、`--authkey` 更可靠。**已加固**：01 现在把 `To authenticate, visit:` 也纳入兜底重试条件，env-key 静默转交互时会自动改走 `--authkey`（离线测试覆盖）。测试壳已改为读取 `uac-01.exit`（01 真实退出码）。
   - 关键排障：`Set-VM -EnhancedSessionTransportType HvSocket` 是**开启**增强会话（会弹「显示配置」对话框挡住合成键盘），`VMBus` 才是基本会话；此前写反导致自动化卡住。
   - 测试后清理：删 `uac_admin`、关闭自动登录、config.json 复位为空模板、删测试产物与桌面快捷方式、删本地 authkey/凭据文件、VM 关机；UAC 注册表回到基线。证据见 `lab\helper49.log`、`lab\uac2-01.log`、`lab\uac2-03.log`、`lab\status-52/53.json`。
-- 2026-10-27 按现场复盘加固：
+- 2026-10-27 依据现场复盘加固：
   - **控制面 TLS 握手被重置**（`BackendState=NeedsLogin` + `fetch control key`/`wsarecv`，但 curl 同地址返回 200）：01 自动给 Tailscale 服务设 `GODEBUG=tlsmlkem=0`、重启服务并重试；变更写 `registry.tailscale-env` journal，03 精确回退。
   - **MSI 安装判定**：不再只看退出码（部分机器返回空）；以安装产品/服务存在 + MSI 日志 `MainEngineThread is returning 0` 判定（`Test-ZcTailscaleInstall`）。
-  - 无内置安装包时改用 `curl.exe --retry` 下载 + 大小/签名校验；join 失败输出 `BackendState/Health`。
-  - **真机回归未做**（无可复用 VM/ISO）。
+  - 无内置安装包时的下载改用 `curl.exe --retry` + 大小/签名校验；join 失败输出 `BackendState/Health` 便于现场判断。
+  - 复盘来源：两个现场会话（细节未随本仓库分发）。**真机回归未做**（本机已无测试 VM/ISO，需重新下载镜像）。
+- 2026-10-27 图形界面（`gui.ps1` + `start.cmd`/`gui.cmd`）：WinForms 窗口，填写运维账号/口令、跳板机 IP、目标 IP、端口、auth key，按钮直接跑 02/01/03；自动写 config.json，命令不加命令行参数（口令不暴露）。已在宿主实机渲染并截图（`lab\gui-screen.png`）；做了解析 + BOM + 启动渲染检查，未逐按钮端到端。
 
 **未验证：**
 - 客户现场实际的 Windows Server 2019 定制镜像（评估版 Desktop/Core 均已通过）、完整现场安全基线、重启恢复；评估版上的真实 UAC 双击完整闭环已通过。
@@ -54,7 +55,9 @@
 
 ## 入口
 
-- `start.cmd`：菜单 `[1] 现场初始化 / [2] 本机连接`。
+- `start.cmd`：双击打开图形界面；带参数时走控制台引擎（如 `start.cmd -Mode 2 -VerifyOnly`）。
+- `gui.cmd`：只打开图形界面（等价于无参数双击 `start.cmd`）。
+- `run.ps1`：控制台菜单（`[1] 现场初始化 / [2] 本机连接`）。
 - `config.json`：运行前填入实际信息，视为密码文件保管。
 - `01-jump-setup.ps1`：现场引擎，默认拒绝执行。只有隔离测试机可显式使用 `-AllowExperimentalSiteSetup`。新增 `-SkipSignatureCheck`、`-AllowExistingAccountUpdate`、`-AllowBroadWinRM`、`-NoRollbackOnFailure` 等显式开关；加 `-UseOnlineInstaller`（或 config `useOnlineInstaller: true`）改为在线下载官方安装包，不再使用内置 MSI（安装时需能访问 `pkgs.tailscale.com`）。
 - `02-connect-site.ps1`：本机引擎；相同转发不写入；冲突直接失败；新建规则写入 connect journal；不再自动重启 IP Helper。
@@ -174,7 +177,7 @@
 1. 预先存在的宽 WinRM 规则仍可能保留；现场若不允许，需要甲方单独审批后手工收紧。
 2. 已有账号被 `-AllowExistingAccountUpdate` 改密后，旧密码无法恢复；默认拒绝改已有账号。
 3. `config.json` 不自动回滚；本机安装的 Tailscale 不自动卸载；Tailscale 节点和 auth key 需管理后台手工吊销。
-4. 客户现场实际定制镜像的“加固后完整 01 + 03”复验仍未做（评估版 2019 Desktop/Core 已通过）。
+4. 尚未在 Server 2019 和真实全新机器上完成“加固后完整 01 + 03”复验。
 5. 安全基线（磁盘加密、日志审计、最小权限、凭据轮换、节点审批）仍需按现场制度补齐。
 
 ## 离线测试
@@ -186,7 +189,7 @@
 .\tests\JoinRetry.Tests.ps1
 ```
 
-四组共 83 项，均不连接现场、不执行真实安装。`State.Tests.ps1` 覆盖 journal 往返、归属判断、变更资源拒绝删除、只删本 run 防火墙、DryRun 零写入、02 connect journal 写入、netsh 规则 DisplayName 回退、`registry.tailscale-env` 回退和源码安全约束；`JoinRetry.Tests.ps1` 覆盖 Join-Tailnet 的交互回退/`--authkey`/TLS-reset 兜底与 MSI 安装结果判定。
+四组共 84 项，均不连接现场、不执行真实安装。`State.Tests.ps1` 覆盖 journal 往返、归属判断、变更资源拒绝删除、只删本 run 防火墙、DryRun 零写入、02 connect journal 写入、netsh 规则 DisplayName 回退、`registry.tailscale-env` 回退和源码安全约束；`JoinRetry.Tests.ps1` 覆盖 Join-Tailnet 的交互回退/`--authkey`/TLS-reset 兜底与 MSI 安装结果判定；`Launcher.Tests.ps1` 另含 `gui.ps1` 的解析与 UTF-8 BOM 检查。
 
 ## 关于“零操作”
 

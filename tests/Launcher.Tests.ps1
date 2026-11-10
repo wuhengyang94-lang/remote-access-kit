@@ -5,6 +5,14 @@ $kit = Split-Path $PSScriptRoot -Parent
 $testRoot = Join-Path $env:TEMP ('remote-kit-test-' + [guid]::NewGuid().ToString('N'))
 $utf8 = New-Object Text.UTF8Encoding($true)
 $passed = 0
+# gui.ps1 must parse and be UTF-8 with BOM (PS 5.1 reads non-BOM files as ANSI).
+$guiPath = Join-Path $kit 'gui.ps1'
+$guiTokens = $null; $guiErrors = $null
+[void][Management.Automation.Language.Parser]::ParseFile($guiPath, [ref]$guiTokens, [ref]$guiErrors)
+if (@($guiErrors).Count -gt 0) { throw 'gui.ps1 has parse errors.' }
+$guiBytes = [IO.File]::ReadAllBytes($guiPath)
+if (-not ($guiBytes.Length -ge 3 -and $guiBytes[0] -eq 0xEF -and $guiBytes[1] -eq 0xBB -and $guiBytes[2] -eq 0xBF)) { throw 'gui.ps1 must be UTF-8 with BOM for PS 5.1.' }
+$passed++
 try {
     New-Item -ItemType Directory -Path $testRoot | Out-Null
     $sandbox = Join-Path $testRoot 'folder with spaces'
