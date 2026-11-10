@@ -108,6 +108,12 @@ $saved = Read-ZcJournal -Path (Get-ZcJournalPath -Root $state -RunId $script:Tes
 Assert-True ($saved.Status -eq 'UndoPartial') 'Partial undo must be recorded as UndoPartial.'
 $pass += 5
 
+$historyCount = @($saved.UndoResults).Count
+$again = Invoke-ZcUndoJournal -Root $state -Journal $saved
+Assert-True ($script:RemovedRules.Count -eq 1 -and @($script:NativeCalls | Where-Object { $_ -match 'listenport=13306' }).Count -eq 1) 'Retry must not replay resources already removed by this run.'
+Assert-True (@($saved.UndoResults).Count -gt $historyCount -and @($saved.Changes).Count -eq 4) 'Retry must append undo history while retaining all ownership records.'
+$pass += 2
+
 # --- tailscale logout must precede uninstall ---
 $tsJournal = [pscustomobject]@{
     Schema = 1; Tool = 'zcode-remote-access-kit'; RunId = 'site-ts-order'; Phase = 'site'

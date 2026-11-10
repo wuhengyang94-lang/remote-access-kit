@@ -13,6 +13,9 @@
 
     Default is a dry-run plan followed by an interactive confirmation. Use
     -Force for unattended execution and -DryRun to only print the plan.
+    The default selects every pending run in the requested scope, newest first.
+    Use -Latest to select only the latest pending run per phase, and -SiteName
+    to restrict the selection to one site. Selection switches are exclusive.
 
 .NOTES
     ASCII-only source on purpose: Windows PowerShell 5.1 misreads UTF-8 .ps1
@@ -24,6 +27,7 @@ param(
     [switch]$Latest,
     [switch]$All,
     [switch]$List,
+    [string]$SiteName,
     [ValidateSet('Site', 'Local', 'All')]
     [string]$Scope = 'Site',
     [switch]$DryRun,
@@ -51,9 +55,8 @@ function Test-Headless {
 }
 
 try {
-    if ($RunId -and ($Latest -or $All)) { throw '-RunId cannot be combined with -Latest or -All.' }
+    if (($RunId -and ($Latest -or $All)) -or ($Latest -and $All)) { throw '-RunId, -All and -Latest are mutually exclusive.' }
     if ($List -and ($DryRun -or $Force)) { throw '-List cannot be combined with -DryRun or -Force.' }
-    if (-not $RunId -and -not $Latest -and -not $All -and -not $List) { $Latest = $true }
 
     $siteRoot = ''
     $localRoot = ''
@@ -63,6 +66,7 @@ try {
     $journals = @()
     if ($siteRoot) { $journals += @(Get-ZcJournals -Root $siteRoot -RunId $RunId -Phase @('site', 'connect')) }
     if ($localRoot) { $journals += @(Get-ZcJournals -Root $localRoot -RunId $RunId -Phase @('local')) }
+    if ($SiteName) { $journals = @($journals | Where-Object { [string]$_.SiteName -eq $SiteName }) }
 
     if ($List) {
         if (@($journals).Count -eq 0) {
@@ -84,28 +88,18 @@ try {
         exit 0
     }
 
-    if (-not $RunId -and -not $All) {
-        # Latest per phase: last site setup, last connect changes and last local changes.
-        $selected = @{}
-        foreach ($j in $journals) {
-            $key = [string]$j.Phase
-            if (-not $selected.ContainsKey($key) -or [string]$j.CreatedUtc -gt [string]$selected[$key].CreatedUtc) {
-                $selected[$key] = $j
-            }
-        }
-        $journals = @($selected.Values)
-    }
+    $journals = @(Select-ZcUndoJournals -Journals $journals -RunId $RunId -SiteName $SiteName -All:$All -Latest:$Latest `
+        -RemoveTailscale:$RemoveTailscale -UnjoinTailscale:$UnjoinTailscale)
 
     $entries = @()
     foreach ($j in $journals) {
-        if ([string]$j.Status -eq 'Undone') { continue }
         $root = $siteRoot
         if ([string]$j.Phase -eq 'local') { $root = $localRoot }
         if (-not $root) { continue }
         $entries += [pscustomobject]@{ Root = $root; Journal = $j }
     }
     if ($entries.Count -eq 0) {
-        Write-Ok 'Nothing to undo (all selected journals are already undone).'
+        Write-Ok 'Nothing to undo for the selected scope and cleanup options.'
         exit 0
     }
 
@@ -114,10 +108,11 @@ try {
 
     Write-Step 'plan'
     $plans = @()
+    $planState = @{}
     foreach ($entry in $entries) {
         try {
             $plan = Invoke-ZcUndoJournal -Root $entry.Root -Journal $entry.Journal -DryRun `
-                -RemoveTailscale:$RemoveTailscale -UnjoinTailscale:$UnjoinTailscale
+                -RemoveTailscale:$RemoveTailscale -UnjoinTailscale:$UnjoinTailscale -PlanState $planState
             $plans += [pscustomobject]@{ Entry = $entry; Plan = $plan }
             foreach ($r in @($plan.Results)) {
                 Write-Host ("  [{0}] {1} {2} {3}" -f $r.Status, $r.Kind, $r.Target, $r.Action) -ForegroundColor Gray
@@ -126,12 +121,6 @@ try {
             Write-Warn2 ("cannot plan run {0}: {1}" -f $entry.Journal.RunId, $_.Exception.Message)
             $plans += [pscustomobject]@{ Entry = $entry; Plan = $null; Error = $_.Exception.Message }
         }
-    }
-
-    if ($DryRun) {
-        Write-Host ''
-        Write-Ok 'Dry run only; nothing was changed.'
-        exit 0
     }
 
     $planned = 0
@@ -143,6 +132,15 @@ try {
         } else {
             $planErrors += $p.Error
         }
+    }
+    if ($DryRun) {
+        Write-Host ''
+        if (@($planErrors).Count -gt 0) {
+            Write-Warn2 'Dry run found resources that cannot be safely reverted; nothing was changed.'
+            exit 1
+        }
+        Write-Ok 'Dry run only; nothing was changed.'
+        exit 0
     }
     if ($planned -eq 0) {
         if (@($planErrors).Count -gt 0) {
@@ -166,6 +164,7 @@ try {
 
     Write-Step 'undo'
     $errors = @()
+    $executionState = @{}
     foreach ($p in $plans) {
         if (-not $p.Plan) {
             $errors += $p.Error
@@ -175,7 +174,7 @@ try {
         Write-Host ("run {0} ({1}) on {2}" -f $entry.Journal.RunId, $entry.Journal.Phase, $entry.Journal.HostName) -ForegroundColor Cyan
         try {
             $result = Invoke-ZcUndoJournal -Root $entry.Root -Journal $entry.Journal `
-                -RemoveTailscale:$RemoveTailscale -UnjoinTailscale:$UnjoinTailscale
+                -RemoveTailscale:$RemoveTailscale -UnjoinTailscale:$UnjoinTailscale -PlanState $executionState
             foreach ($r in @($result.Results)) {
                 $color = 'Gray'
                 if ($r.Status -eq 'Error') { $color = 'Red' }

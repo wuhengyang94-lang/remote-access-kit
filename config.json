@@ -5,6 +5,8 @@
   "siteName": "",
   "jumpHost": "",
   "targetServer": "",
+  "connectionMode": "Direct",
+  "credentialId": "",
   "dbPort": 13306,
   "webPort": 18080,
   "rdpPort": 13389,

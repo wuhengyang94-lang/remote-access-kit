@@ -4,3 +4,8 @@ config.local.json
 *.local.json
 profile-*.txt
 *.log
+site-profile-*.md
+access-result.txt
+access-result.txt.backup-*
+*.tmp
+*.zip

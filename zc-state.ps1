@@ -112,6 +112,72 @@ function Add-ZcChange {
     return $change
 }
 
+function Get-ZcBytesHash {
+    param([byte[]]$Bytes)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($sha.ComputeHash($Bytes))).Replace('-', '') }
+    finally { $sha.Dispose() }
+}
+
+function Initialize-ZcProfileBackupRoot {
+    param([string]$Root)
+    $path = Join-Path $Root 'profile-backups'
+    if (-not (Test-Path -LiteralPath $path)) { [void][IO.Directory]::CreateDirectory($path) }
+    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    # Persist only the DACL; setting owner/SACL can require audit privileges.
+    $acl = [IO.Directory]::GetAccessControl($path, [Security.AccessControl.AccessControlSections]::Access)
+    $acl.SetAccessRuleProtection($true, $false)
+    foreach ($existing in @($acl.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]))) { [void]$acl.RemoveAccessRuleSpecific($existing) }
+    foreach ($principal in @($sid, 'S-1-5-18', 'S-1-5-32-544') | Select-Object -Unique) {
+        $identity = New-Object Security.Principal.SecurityIdentifier($principal)
+        $rule = New-Object Security.AccessControl.FileSystemAccessRule($identity, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
+        [void]$acl.AddAccessRule($rule)
+    }
+    [IO.Directory]::SetAccessControl($path, $acl)
+    return $path
+}
+
+function Write-ZcFileBytes {
+    param([string]$Path, [byte[]]$Bytes)
+    $temp = $Path + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
+    try {
+        [IO.File]::WriteAllBytes($temp, $Bytes)
+        if ([IO.File]::Exists($Path)) { [IO.File]::Replace($temp, $Path, [System.Management.Automation.Language.NullString]::Value) }
+        else { [IO.File]::Move($temp, $Path) }
+    } finally {
+        if ([IO.File]::Exists($temp)) { [IO.File]::Delete($temp) }
+    }
+}
+
+function Save-ZcProfile {
+    param([string]$Root, $Journal, [string]$Path, [string]$Content, [string]$Marker)
+    if (-not $Root -or -not $Journal -or -not $Path -or -not $Marker) { throw 'Profile root, journal, path and marker are required.' }
+    if ($Content.IndexOf($Marker, [StringComparison]::Ordinal) -lt 0) { throw 'Profile content must contain its run marker.' }
+    $Root = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Root)
+    $fullPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+    if ([IO.Directory]::Exists($fullPath)) { throw 'Profile destination must be a file.' }
+    $existed = [IO.File]::Exists($fullPath)
+    $backupPath = ''; $backupHash = ''
+    if ($existed) {
+        $backupRoot = Initialize-ZcProfileBackupRoot -Root $Root
+        $backupPath = Join-Path $backupRoot ([guid]::NewGuid().ToString('N') + '.bin')
+        $original = [IO.File]::ReadAllBytes($fullPath)
+        $backupFile = [IO.File]::Open($backupPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try { $backupFile.Write($original, 0, $original.Length) }
+        finally { $backupFile.Dispose() }
+        $backupHash = Get-ZcBytesHash -Bytes $original
+    }
+    $encoding = New-Object Text.UTF8Encoding($false)
+    $bytes = $encoding.GetBytes($Content)
+    # Persist ownership and the original bytes before replacing the destination.
+    Add-ZcChange -Root $Root -Journal $Journal -Kind 'file.profile' -Data @{
+        Path = $fullPath; Marker = $Marker; ExistedBefore = $existed
+        BackupPath = $backupPath; BackupHash = $backupHash; ContentHash = (Get-ZcBytesHash -Bytes $bytes)
+    } | Out-Null
+    Write-ZcFileBytes -Path $fullPath -Bytes $bytes
+    return $fullPath
+}
+
 function Read-ZcJournal {
     param([string]$Path)
     $j = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -135,6 +201,151 @@ function Get-ZcJournals {
         } catch { }
     }
     return @($out | Sort-Object CreatedUtc)
+}
+
+function Get-ZcUndoCompletedIndexes {
+    param($Journal)
+    $completed = @($Journal.UndoCompleted | Where-Object { $null -ne $_ } | ForEach-Object { [int]$_ })
+    # Older journals used Undone even when optional Tailscale cleanup was kept.
+    if (-not $Journal.PSObject.Properties['UndoCompleted'] -and [string]$Journal.Status -in @('Undone', 'RolledBack')) {
+        for ($index = 0; $index -lt @($Journal.Changes).Count; $index++) {
+            $kind = [string]$Journal.Changes[$index].Kind
+            if ($kind -notin @('tailscale.install', 'tailscale.join') -or
+                @($Journal.UndoResults | Where-Object { [string]$_.Kind -eq $kind -and [string]$_.Status -eq 'Removed' }).Count -gt 0) {
+                $completed += $index
+            }
+        }
+    }
+    return @($completed | Select-Object -Unique)
+}
+
+function Get-ZcUndoChangeEntries {
+    param($Journal, [switch]$TailscaleOnly)
+    $completed = @(Get-ZcUndoCompletedIndexes -Journal $Journal)
+    for ($index = 0; $index -lt @($Journal.Changes).Count; $index++) {
+        if ($completed -contains $index) { continue }
+        $change = $Journal.Changes[$index]
+        if ($TailscaleOnly -and [string]$change.Kind -notin @('tailscale.install', 'tailscale.join')) { continue }
+        if ([string]$change.Kind -eq 'tailscale.install' -and [bool]$change.Data.InstalledBefore) { continue }
+        if ([string]$change.Kind -eq 'tailscale.join' -and -not [bool]$change.Data.JoinedByTool) { continue }
+        [pscustomobject]@{ Index = $index; Change = $change }
+    }
+}
+
+function Select-ZcUndoJournals {
+    param([object[]]$Journals, [string]$RunId, [string]$SiteName, [switch]$All, [switch]$Latest, [switch]$RemoveTailscale, [switch]$UnjoinTailscale)
+    $selectorCount = [int][bool]$RunId + [int][bool]$All + [int][bool]$Latest
+    if ($selectorCount -gt 1) { throw '-RunId, -All and -Latest are mutually exclusive.' }
+    $eligible = @()
+    foreach ($journal in @($Journals)) {
+        if ($RunId -and [string]$journal.RunId -ne $RunId) { continue }
+        if ($SiteName -and [string]$journal.SiteName -ne $SiteName) { continue }
+        $pending = @(Get-ZcUndoChangeEntries -Journal $journal | Where-Object {
+            [string]$_.Change.Kind -notin @('tailscale.install', 'tailscale.join') -or
+            ([string]$_.Change.Kind -eq 'tailscale.install' -and $RemoveTailscale) -or
+            ([string]$_.Change.Kind -eq 'tailscale.join' -and $UnjoinTailscale)
+        })
+        if ($pending.Count -gt 0) { $eligible += $journal }
+    }
+    $eligible = @($eligible | Sort-Object CreatedUtc -Descending)
+    if (-not $Latest) { return $eligible }
+    $phases = @{}
+    foreach ($journal in $eligible) {
+        if ($phases.ContainsKey([string]$journal.Phase)) { continue }
+        $phases[[string]$journal.Phase] = $true
+        $journal
+    }
+}
+
+function Complete-ZcUndoAttempt {
+    param([string]$Root, $Journal, [object[]]$Results, [int[]]$Completed)
+    $Journal | Add-Member -MemberType NoteProperty -Name UndoCompleted -Value @($Completed | Select-Object -Unique) -Force
+    $Journal.UndoResults = @($Journal.UndoResults) + @($Results)
+    $pending = @(Get-ZcUndoChangeEntries -Journal $Journal)
+    if (@($Results | Where-Object { $_.Status -eq 'Error' }).Count -gt 0 -or
+        @($pending | Where-Object { [string]$_.Change.Kind -notin @('tailscale.install', 'tailscale.join') }).Count -gt 0) { $Journal.Status = 'UndoPartial' }
+    elseif ($pending.Count -gt 0) { $Journal.Status = 'UndoneOptional' }
+    else { $Journal.Status = 'Undone' }
+    Save-ZcJournal -Root $Root -Journal $Journal | Out-Null
+}
+
+function Get-ZcUndoFileState {
+    param([string]$Path, [hashtable]$PlanState, [switch]$DryRun)
+    if ($DryRun -and $null -ne $PlanState -and $PlanState.Files.ContainsKey($Path)) { return $PlanState.Files[$Path] }
+    if (-not [IO.File]::Exists($Path)) { return [pscustomobject]@{ Exists = $false; Bytes = [byte[]]@() } }
+    return [pscustomobject]@{ Exists = $true; Bytes = [IO.File]::ReadAllBytes($Path) }
+}
+
+function Get-ZcUndoRegState {
+    param([string]$Path, [string]$Name, [hashtable]$PlanState, [switch]$DryRun)
+    $key = $Path + '|' + $Name
+    if ($DryRun -and $null -ne $PlanState -and $PlanState.Registry.ContainsKey($key)) { return $PlanState.Registry[$key] }
+    return (Get-ZcRegState -Path $Path -Name $Name)
+}
+
+function Set-ZcUndoRegPlan {
+    param([hashtable]$PlanState, [string]$Path, [string]$Name, $Value, [bool]$Exists)
+    if ($null -ne $PlanState) { $PlanState.Registry[$Path + '|' + $Name] = [pscustomobject]@{ Exists = $Exists; Value = $Value } }
+}
+
+function Initialize-ZcUndoPlanState {
+    param([hashtable]$PlanState)
+    if ($null -eq $PlanState) { $PlanState = @{} }
+    foreach ($key in @('Files', 'Registry', 'DeletedByUndo')) { if (-not $PlanState.ContainsKey($key)) { $PlanState[$key] = @{} } }
+    return $PlanState
+}
+
+function Invoke-ZcUndoFileChange {
+    param([string]$Root, $Change, [hashtable]$PlanState, [switch]$DryRun)
+    $kind = [string]$Change.Kind; $d = $Change.Data
+    $path = [string]$d.Path; $marker = [string]$d.Marker; $backup = [string]$d.BackupPath
+    $restore = [bool]$d.ExistedBefore -or [bool]$backup
+    $action = 'delete file'
+    if ($restore) { $action = 'restore file' }
+    try {
+        $file = Get-ZcUndoFileState -Path $path -PlanState $PlanState -DryRun:$DryRun
+        if (-not $file.Exists) {
+            if (-not $restore) { return (New-ZcUndoResult $kind $path 'none' 'Skipped' 'file not present') }
+            # Legacy access-result journals did not back up an older tool file.
+            # Only a deletion proven in this same undo permits the older backup.
+            if (-not $PlanState.DeletedByUndo[$path]) { throw 'file missing; backup not restored without undo ownership' }
+        } else {
+            $current = [byte[]]$file.Bytes
+            $currentHash = Get-ZcBytesHash -Bytes $current
+            if ($restore -and $d.BackupHash -and $currentHash -eq [string]$d.BackupHash) {
+                if ($DryRun) { $PlanState.Files[$path] = $file }
+                $PlanState.DeletedByUndo[$path] = $false
+                return (New-ZcUndoResult $kind $path 'none' 'Skipped' 'original content already present')
+            }
+            $text = [Text.Encoding]::UTF8.GetString($current)
+            if (-not $marker -or $text.IndexOf($marker, [StringComparison]::Ordinal) -lt 0) { throw 'marker mismatch; not changed' }
+            if ($d.ContentHash -and $currentHash -ne [string]$d.ContentHash) { throw 'file content changed; not changed' }
+        }
+        $original = $null
+        if ($restore) {
+            if ($kind -eq 'file.profile') {
+                $backupPrefix = [IO.Path]::GetFullPath((Join-Path $Root 'profile-backups')).TrimEnd('\') + '\'
+                if (-not $backup -or -not [IO.Path]::GetFullPath($backup).StartsWith($backupPrefix, [StringComparison]::OrdinalIgnoreCase)) { throw 'invalid profile backup path; not changed' }
+            }
+            if (-not [IO.File]::Exists($backup)) { throw 'file backup missing; not changed' }
+            $original = [IO.File]::ReadAllBytes($backup)
+            if (($kind -eq 'file.profile' -or $d.ContentHash -or $d.BackupHash) -and
+                (-not $d.BackupHash -or (Get-ZcBytesHash -Bytes $original) -ne [string]$d.BackupHash)) { throw 'file backup hash mismatch; not changed' }
+        }
+        if ($DryRun) {
+            $PlanState.Files[$path] = [pscustomobject]@{ Exists = $restore; Bytes = $original }
+            $PlanState.DeletedByUndo[$path] = -not $restore
+            return (New-ZcUndoResult $kind $path $action 'Planned' '')
+        }
+        if ($restore) {
+            Write-ZcFileBytes -Path $path -Bytes $original
+            $PlanState.DeletedByUndo[$path] = $false
+            return (New-ZcUndoResult $kind $path $action 'Restored' 'original bytes restored')
+        }
+        Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+        $PlanState.DeletedByUndo[$path] = $true
+        return (New-ZcUndoResult $kind $path $action 'Removed' '')
+    } catch { return (New-ZcUndoResult $kind $path $action 'Error' $_.Exception.Message) }
 }
 
 function Invoke-ZcNative {
@@ -304,20 +515,26 @@ function Invoke-ZcUndoJournal {
         $Journal,
         [switch]$DryRun,
         [switch]$RemoveTailscale,
-        [switch]$UnjoinTailscale
+        [switch]$UnjoinTailscale,
+        [switch]$TailscaleOnly,
+        [hashtable]$PlanState
     )
     if ($Journal.HostName -ne $env:COMPUTERNAME) {
         throw "Journal belongs to '$($Journal.HostName)', not '$env:COMPUTERNAME'. Run undo on the correct host."
     }
-    if ($Journal.Phase -eq 'local') { return (Invoke-ZcUndoLocalJournal -Root $Root -Journal $Journal -DryRun:$DryRun) }
+    $PlanState = Initialize-ZcUndoPlanState -PlanState $PlanState
+    if ($Journal.Phase -eq 'local') { return (Invoke-ZcUndoLocalJournal -Root $Root -Journal $Journal -DryRun:$DryRun -TailscaleOnly:$TailscaleOnly -PlanState $PlanState) }
 
     $results = New-Object System.Collections.ArrayList
-    # Log out of the tailnet before uninstalling Tailscale. Keep the install
-    # undo last even though the journal recorded it before the join.
-    $allChanges = @($Journal.Changes)
-    $orderedChanges = @(@($allChanges | Where-Object { [string]$_.Kind -ne 'tailscale.install' })) +
-                      @(@($allChanges | Where-Object { [string]$_.Kind -eq 'tailscale.install' }))
-    foreach ($c in $orderedChanges) {
+    $completed = @(Get-ZcUndoCompletedIndexes -Journal $Journal)
+    # Log out before uninstalling, and keep run-file backups until restores end.
+    $allChanges = @(Get-ZcUndoChangeEntries -Journal $Journal -TailscaleOnly:$TailscaleOnly)
+    $orderedChanges = @(@($allChanges | Where-Object { [string]$_.Change.Kind -notin @('tailscale.install', 'tempdir') })) +
+                      @(@($allChanges | Where-Object { [string]$_.Change.Kind -eq 'tailscale.install' })) +
+                      @(@($allChanges | Where-Object { [string]$_.Change.Kind -eq 'tempdir' }))
+    foreach ($entry in $orderedChanges) {
+        $c = $entry.Change
+        $resultStart = $results.Count
         $kind = [string]$c.Kind
         $d = $c.Data
         switch ($kind) {
@@ -339,12 +556,17 @@ function Invoke-ZcUndoJournal {
             }
             'tempdir' {
                 $path = [string]$d.Path
-                if ($path -and $path.StartsWith($Root, [StringComparison]::OrdinalIgnoreCase) -and (Test-Path -LiteralPath $path)) {
+                $rootPrefix = [IO.Path]::GetFullPath($Root).TrimEnd('\') + '\'
+                $targetPath = ''
+                if ($path) { $targetPath = [IO.Path]::GetFullPath($path) }
+                if (@($results | Where-Object { $_.Status -eq 'Error' }).Count -gt 0) {
+                    [void]$results.Add((New-ZcUndoResult $kind $path 'keep directory' 'Error' 'run files retained because undo is incomplete'))
+                } elseif ($targetPath -and $targetPath.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase) -and (Test-Path -LiteralPath $targetPath)) {
                     if ($DryRun) {
                         [void]$results.Add((New-ZcUndoResult $kind $path 'delete directory' 'Planned' ''))
                     } else {
                         try {
-                            Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop
+                            Remove-Item -LiteralPath $targetPath -Recurse -Force -ErrorAction Stop
                             [void]$results.Add((New-ZcUndoResult $kind $path 'delete directory' 'Removed' ''))
                         } catch {
                             [void]$results.Add((New-ZcUndoResult $kind $path 'delete directory' 'Error' $_.Exception.Message))
@@ -502,11 +724,12 @@ function Invoke-ZcUndoJournal {
             { $_ -eq 'registry.latfp' -or $_ -eq 'registry.iprouter' } {
                 $path = [string]$d.Path
                 $name = [string]$d.Name
-                $cur = Get-ZcRegState -Path $path -Name $name
+                $cur = Get-ZcUndoRegState -Path $path -Name $name -PlanState $PlanState -DryRun:$DryRun
                 if ($cur.Exists -and [string]$cur.Value -ne [string]$d.ValueSet) {
                     [void]$results.Add((New-ZcUndoResult $kind $name 'restore registry' 'Error' 'current value differs; not restored'))
                 } elseif ($DryRun) {
                     [void]$results.Add((New-ZcUndoResult $kind $name 'restore registry' 'Planned' ''))
+                    Set-ZcUndoRegPlan -PlanState $PlanState -Path $path -Name $name -Value $d.ValueBefore -Exists ([bool]$d.ExistedBefore)
                 } else {
                     try {
                         Set-ZcRegState -Path $path -Name $name -Value $d.ValueBefore -Exists ([bool]$d.ExistedBefore)
@@ -519,13 +742,14 @@ function Invoke-ZcUndoJournal {
             'registry.tailscale-env' {
                 $path = [string]$d.Path
                 $name = [string]$d.Name
-                $cur = Get-ZcRegState -Path $path -Name $name
+                $cur = Get-ZcUndoRegState -Path $path -Name $name -PlanState $PlanState -DryRun:$DryRun
                 $curText = (@($cur.Value) -join "`n")
                 $setText = (@($d.ValueSet) -join "`n")
                 if ($cur.Exists -and $curText -ne $setText) {
                     [void]$results.Add((New-ZcUndoResult $kind $name 'restore registry' 'Error' 'current value differs; not restored'))
                 } elseif ($DryRun) {
                     [void]$results.Add((New-ZcUndoResult $kind $name 'restore registry' 'Planned' ''))
+                    Set-ZcUndoRegPlan -PlanState $PlanState -Path $path -Name $name -Value $d.ValueBefore -Exists ([bool]$d.ExistedBefore)
                 } else {
                     try {
                         Set-ZcRegState -Path $path -Name $name -Value $d.ValueBefore -Exists ([bool]$d.ExistedBefore)
@@ -538,6 +762,8 @@ function Invoke-ZcUndoJournal {
             'tailscale.install' {
                 if (-not $RemoveTailscale) {
                     [void]$results.Add((New-ZcUndoResult $kind 'Tailscale' 'none' 'Skipped' 'install kept; use -RemoveTailscale to uninstall'))
+                } elseif ($UnjoinTailscale -and ($PlanState.TailscaleLogoutBlocked -or @($results | Where-Object { $_.Kind -eq 'tailscale.join' -and $_.Status -in @('Error', 'Skipped') }).Count -gt 0)) {
+                    [void]$results.Add((New-ZcUndoResult $kind 'Tailscale' 'uninstall MSI' 'Error' 'logout did not complete; Tailscale was not uninstalled'))
                 } elseif ([bool]$d.InstalledBefore) {
                     [void]$results.Add((New-ZcUndoResult $kind 'Tailscale' 'none' 'Skipped' 'Tailscale existed before this run'))
                 } elseif (-not [string]$d.ProductCode) {
@@ -569,7 +795,7 @@ function Invoke-ZcUndoJournal {
                         if ($r.ExitCode -eq 0) {
                             [void]$results.Add((New-ZcUndoResult $kind 'Tailscale node' 'tailscale logout' 'Removed' ''))
                         } elseif ($r.Text -match 'TIMEOUT|already in use|401') {
-                            [void]$results.Add((New-ZcUndoResult $kind 'Tailscale node' 'tailscale logout' 'Skipped' 'CLI blocked by Tailscale GUI/IPC; revoke or remove the node in the admin console'))
+                            [void]$results.Add((New-ZcUndoResult $kind 'Tailscale node' 'tailscale logout' 'Error' 'CLI blocked by Tailscale GUI/IPC; retry logout or revoke the node in the admin console'))
                         } else {
                             [void]$results.Add((New-ZcUndoResult $kind 'Tailscale node' 'tailscale logout' 'Error' $r.Text.Trim()))
                         }
@@ -577,30 +803,7 @@ function Invoke-ZcUndoJournal {
                 }
             }
             'file.access-result' {
-                $path = [string]$d.Path
-                $marker = [string]$d.Marker
-                if (-not (Test-Path -LiteralPath $path)) {
-                    [void]$results.Add((New-ZcUndoResult $kind $path 'none' 'Skipped' 'file not present'))
-                } else {
-                    $text = Get-Content -LiteralPath $path -Raw -ErrorAction SilentlyContinue
-                    if (-not $text -or $text.IndexOf($marker, [StringComparison]::OrdinalIgnoreCase) -lt 0) {
-                        [void]$results.Add((New-ZcUndoResult $kind $path 'delete file' 'Error' 'marker mismatch; not removed'))
-                    } elseif ($DryRun) {
-                        [void]$results.Add((New-ZcUndoResult $kind $path 'delete file' 'Planned' ''))
-                    } else {
-                        try {
-                            Remove-Item -LiteralPath $path -Force -ErrorAction Stop
-                            $detail = ''
-                            if ($d.BackupPath -and (Test-Path -LiteralPath ([string]$d.BackupPath))) {
-                                Move-Item -LiteralPath ([string]$d.BackupPath) -Destination $path -Force
-                                $detail = 'backup restored'
-                            }
-                            [void]$results.Add((New-ZcUndoResult $kind $path 'delete file' 'Removed' $detail))
-                        } catch {
-                            [void]$results.Add((New-ZcUndoResult $kind $path 'delete file' 'Error' $_.Exception.Message))
-                        }
-                    }
-                }
+                [void]$results.Add((Invoke-ZcUndoFileChange -Root $Root -Change $c -PlanState $PlanState -DryRun:$DryRun))
             }
             'file.config' {
                 [void]$results.Add((New-ZcUndoResult $kind ([string]$d.Path) 'none' 'Skipped' 'config.json is user-editable and is not reverted automatically'))
@@ -609,21 +812,30 @@ function Invoke-ZcUndoJournal {
                 [void]$results.Add((New-ZcUndoResult $kind '' 'none' 'Skipped' 'unknown change kind'))
             }
         }
+        $changeResults = @($results | Select-Object -Skip $resultStart)
+        if ($kind -eq 'tailscale.join' -and $UnjoinTailscale -and @($changeResults | Where-Object { $_.Status -in @('Error', 'Skipped') }).Count -gt 0) { $PlanState.TailscaleLogoutBlocked = $true }
+        foreach ($item in $changeResults) { $item | Add-Member -MemberType NoteProperty -Name ChangeIndex -Value ([int]$entry.Index) }
+        $done = $changeResults.Count -gt 0 -and @($changeResults | Where-Object { $_.Status -in @('Error', 'Planned') }).Count -eq 0
+        if ($kind -in @('tailscale.install', 'tailscale.join')) { $done = @($changeResults | Where-Object { $_.Status -eq 'Removed' }).Count -gt 0 }
+        if (-not $DryRun -and $done) { $completed += [int]$entry.Index }
     }
 
     $errors = @($results | Where-Object { $_.Status -eq 'Error' })
     if (-not $DryRun) {
-        $Journal.UndoResults = @($results)
-        if ($errors.Count -eq 0) { $Journal.Status = 'Undone' } else { $Journal.Status = 'UndoPartial' }
-        Save-ZcJournal -Root $Root -Journal $Journal | Out-Null
+        Complete-ZcUndoAttempt -Root $Root -Journal $Journal -Results @($results) -Completed $completed
     }
     return [pscustomobject]@{ Results = @($results); Errors = $errors; Status = $Journal.Status }
 }
 
 function Invoke-ZcUndoLocalJournal {
-    param([string]$Root, $Journal, [switch]$DryRun)
+    param([string]$Root, $Journal, [switch]$DryRun, [switch]$TailscaleOnly, [hashtable]$PlanState)
+    $PlanState = Initialize-ZcUndoPlanState -PlanState $PlanState
     $results = New-Object System.Collections.ArrayList
-    foreach ($c in @($Journal.Changes)) {
+    $completed = @(Get-ZcUndoCompletedIndexes -Journal $Journal)
+    $entries = @(Get-ZcUndoChangeEntries -Journal $Journal -TailscaleOnly:$TailscaleOnly | Sort-Object Index -Descending)
+    foreach ($entry in $entries) {
+        $c = $entry.Change
+        $resultStart = $results.Count
         $kind = [string]$c.Kind
         $d = $c.Data
         switch ($kind) {
@@ -631,11 +843,13 @@ function Invoke-ZcUndoLocalJournal {
                 $expected = [string]$d.ExpectedValue
                 $prior = [string]$d.PriorValue
                 $cur = ''
-                try { $cur = [string](Get-Item WSMan:\localhost\Client\TrustedHosts -ErrorAction Stop).Value } catch { $cur = '' }
+                if ($DryRun -and $PlanState.ContainsKey('TrustedHosts')) { $cur = [string]$PlanState.TrustedHosts }
+                else { try { $cur = [string](Get-Item WSMan:\localhost\Client\TrustedHosts -ErrorAction Stop).Value } catch { $cur = '' } }
                 if ($cur -ne $expected) {
                     [void]$results.Add((New-ZcUndoResult $kind 'TrustedHosts' 'restore' 'Error' 'current value differs; not restored'))
                 } elseif ($DryRun) {
                     [void]$results.Add((New-ZcUndoResult $kind 'TrustedHosts' 'restore' 'Planned' ''))
+                    $PlanState.TrustedHosts = $prior
                 } else {
                     try {
                         if ($prior) {
@@ -650,36 +864,19 @@ function Invoke-ZcUndoLocalJournal {
                 }
             }
             'file.profile' {
-                $path = [string]$d.Path
-                $marker = [string]$d.Marker
-                if (-not (Test-Path -LiteralPath $path)) {
-                    [void]$results.Add((New-ZcUndoResult $kind $path 'none' 'Skipped' 'file not present'))
-                } else {
-                    $text = Get-Content -LiteralPath $path -Raw -ErrorAction SilentlyContinue
-                    if (-not $text -or $text.IndexOf($marker, [StringComparison]::OrdinalIgnoreCase) -lt 0) {
-                        [void]$results.Add((New-ZcUndoResult $kind $path 'delete file' 'Error' 'marker mismatch; not removed'))
-                    } elseif ($DryRun) {
-                        [void]$results.Add((New-ZcUndoResult $kind $path 'delete file' 'Planned' ''))
-                    } else {
-                        try {
-                            Remove-Item -LiteralPath $path -Force -ErrorAction Stop
-                            [void]$results.Add((New-ZcUndoResult $kind $path 'delete file' 'Removed' ''))
-                        } catch {
-                            [void]$results.Add((New-ZcUndoResult $kind $path 'delete file' 'Error' $_.Exception.Message))
-                        }
-                    }
-                }
+                [void]$results.Add((Invoke-ZcUndoFileChange -Root $Root -Change $c -PlanState $PlanState -DryRun:$DryRun))
             }
             default {
                 [void]$results.Add((New-ZcUndoResult $kind '' 'none' 'Skipped' 'unknown local change kind'))
             }
         }
+        $changeResults = @($results | Select-Object -Skip $resultStart)
+        foreach ($item in $changeResults) { $item | Add-Member -MemberType NoteProperty -Name ChangeIndex -Value ([int]$entry.Index) }
+        if (-not $DryRun -and $changeResults.Count -gt 0 -and @($changeResults | Where-Object { $_.Status -in @('Error', 'Planned') }).Count -eq 0) { $completed += [int]$entry.Index }
     }
     $errors = @($results | Where-Object { $_.Status -eq 'Error' })
     if (-not $DryRun) {
-        $Journal.UndoResults = @($results)
-        if ($errors.Count -eq 0) { $Journal.Status = 'Undone' } else { $Journal.Status = 'UndoPartial' }
-        Save-ZcJournal -Root $Root -Journal $Journal | Out-Null
+        Complete-ZcUndoAttempt -Root $Root -Journal $Journal -Results @($results) -Completed $completed
     }
     return [pscustomobject]@{ Results = @($results); Errors = $errors; Status = $Journal.Status }
 }

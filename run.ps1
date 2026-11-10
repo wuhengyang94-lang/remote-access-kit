@@ -12,7 +12,8 @@ param(
     [ValidateSet(0,1,2)][int]$Mode = 0,
     [switch]$VerifyOnly,
     [switch]$AllowExperimentalSiteSetup,
-    [switch]$OnlineInstaller
+    [switch]$OnlineInstaller,
+    [ValidateSet('Direct','Forward')][string]$ConnectionMode
 )
 $ErrorActionPreference = 'Stop'
 try { [Console]::OutputEncoding = New-Object Text.UTF8Encoding($false) } catch { }
@@ -32,6 +33,7 @@ function Get-ResultValue([string]$Key) {
 }
 
 try {
+    . (Join-Path $root 'zc-config.ps1')
     if ($Mode -eq 0) {
         if (Test-Headless) { throw 'Headless usage requires -Mode 1 or -Mode 2. No prompt is allowed.' }
         Write-Host ''
@@ -44,7 +46,7 @@ try {
     }
     $configPath = Join-Path $root 'config.json'
     if (-not (Test-Path -LiteralPath $configPath)) { throw 'config.json is missing. Copy the template and fill in project settings.' }
-    $cfg = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $cfg = Read-ZcConfig -Path $configPath
     if (-not $cfg.opsUser -or -not $cfg.opsPassword) { throw 'Set opsUser and opsPassword in config.json before running. No hidden password prompt is used.' }
     if ($cfg.siteName -and [string]$cfg.siteName -match '[<>:"/\\|?*]') { throw 'siteName contains invalid filename characters.' }
 
@@ -63,19 +65,26 @@ try {
             AllowExperimentalSiteSetup = $true
         }
         if ($OnlineInstaller -or [bool]$cfg.useOnlineInstaller) { $parameters['UseOnlineInstaller'] = $true }
+        $resultPath = Join-Path $root 'access-result.txt'
+        $priorResult = $(if (Test-Path -LiteralPath $resultPath) { [IO.File]::ReadAllText($resultPath) } else { '' })
         $global:LASTEXITCODE = 0
         & (Join-Path $root '01-jump-setup.ps1') @parameters
         $engineExit = $LASTEXITCODE
         if ($engineExit -ne 0) { throw "Site engine failed (exit $engineExit)." }
         $ip = Get-ResultValue 'JumpHost'
         if (-not $ip) { throw 'Site setup did not produce an access result. It is not verified.' }
+        $currentResult = [IO.File]::ReadAllText($resultPath)
+        if ($currentResult -ceq $priorResult) { throw 'Site setup did not produce a fresh access result. An earlier run cannot prove this run succeeded.' }
         Write-Host ('现场结果：{0}。保留工具目录中的接入结果供本机读取。' -f $ip) -ForegroundColor Green
     }
     else {
         $jump = [string]$cfg.jumpHost
         if (-not $jump) { $jump = Get-ResultValue 'JumpHost' }
         if (-not $jump) { throw 'Set jumpHost or bring back access-result.txt from the site.' }
-        if ((Test-Headless) -and -not $cfg.targetServer) { throw 'Headless usage requires targetServer in config.json. Do not guess a production server.' }
+        $connection = $(if ($ConnectionMode) { $ConnectionMode } else { [string]$cfg.connectionMode })
+        if ($connection -notin @('Direct','Forward')) { throw 'connectionMode must be Direct or Forward.' }
+        $direct = $connection -eq 'Direct'
+        if (-not $direct -and -not $cfg.targetServer) { throw 'Forward mode requires an explicit targetServer in config.json. Do not guess a production server.' }
         $name = [string]$cfg.siteName
         if (-not $name) { $name = 'site' }
         $profile = [string]$cfg.profilePath
@@ -84,12 +93,14 @@ try {
             JumpHost = $jump
             JumpUser = [string]$cfg.opsUser
             JumpPassword = [string]$cfg.opsPassword
-            Target = [string]$cfg.targetServer
+            Target = $(if ($direct) { '' } else { [string]$cfg.targetServer })
             Forward = [string[]]@($cfg.extraForwards)
+            DirectOnly = $direct
             SiteName = $name
             ProfilePath = $profile
             VerifyOnly = [bool]$VerifyOnly
         }
+        if ($direct) { $parameters.Forward = [string[]]@() }
         foreach ($entry in @(@('dbPort','DbPort'),@('webPort','WebPort'),@('rdpPort','RdpPort'))) {
             $value = $cfg.($entry[0])
             if ($null -ne $value) { $parameters[$entry[1]] = [int]$value }

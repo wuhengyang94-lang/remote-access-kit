@@ -794,18 +794,22 @@ function Write-AccessResult([string]$TsIp, [string]$Site) {
         $marker
     ) -join "`r`n"
     $utf8NoBom = New-Object Text.UTF8Encoding($false)
+    $contentBytes = $utf8NoBom.GetBytes($content)
+    $contentHash = Get-ZcBytesHash -Bytes $contentBytes
 
     $resultPath = Join-Path $PSScriptRoot 'access-result.txt'
     $backupPath = ''
-    $snap = $script:Journal.Snapshot.AccessResult
     if (Test-Path -LiteralPath $resultPath) {
-        if (-not [bool]$snap.HasMarker) {
-            $backupPath = $resultPath + '.backup-' + (Get-Date -Format 'yyyyMMddHHmmss')
-            Move-Item -LiteralPath $resultPath -Destination $backupPath -Force
-        }
+        $backupPath = Join-Path $script:RunDir ('access-result-' + [guid]::NewGuid().ToString('N') + '.bak')
+        Copy-Item -LiteralPath $resultPath -Destination $backupPath -ErrorAction Stop
     }
-    [IO.File]::WriteAllText($resultPath, $content, $utf8NoBom)
-    Add-SiteChange 'file.access-result' @{ Path = $resultPath; Marker = $marker; BackupPath = $backupPath }
+    Add-SiteChange 'file.access-result' @{
+        Path = $resultPath; Marker = $marker; BackupPath = $backupPath
+        ExistedBefore = [bool]$backupPath
+        BackupHash = $(if ($backupPath) { (Get-FileHash -LiteralPath $backupPath -Algorithm SHA256).Hash } else { '' })
+        ContentHash = $contentHash
+    }
+    Write-ZcFileBytes -Path $resultPath -Bytes $contentBytes
     Write-Ok "result written: $resultPath"
 
     try {
@@ -814,15 +818,16 @@ function Write-AccessResult([string]$TsIp, [string]$Site) {
             $desktopPath = Join-Path $desktop 'access-result.txt'
             $desktopBackup = ''
             if (Test-Path -LiteralPath $desktopPath) {
-                $oldText = Get-Content -LiteralPath $desktopPath -Raw -ErrorAction SilentlyContinue
-                $hasMarker = [bool]($oldText -and $oldText.IndexOf('GeneratedBy=' + $script:ZcToolName + ':', [StringComparison]::OrdinalIgnoreCase) -ge 0)
-                if (-not $hasMarker) {
-                    $desktopBackup = $desktopPath + '.backup-' + (Get-Date -Format 'yyyyMMddHHmmss')
-                    Move-Item -LiteralPath $desktopPath -Destination $desktopBackup -Force
-                }
+                $desktopBackup = Join-Path $script:RunDir ('desktop-result-' + [guid]::NewGuid().ToString('N') + '.bak')
+                Copy-Item -LiteralPath $desktopPath -Destination $desktopBackup -ErrorAction Stop
             }
-            [IO.File]::WriteAllText($desktopPath, $content, $utf8NoBom)
-            Add-SiteChange 'file.access-result' @{ Path = $desktopPath; Marker = $marker; BackupPath = $desktopBackup }
+            Add-SiteChange 'file.access-result' @{
+                Path = $desktopPath; Marker = $marker; BackupPath = $desktopBackup
+                ExistedBefore = [bool]$desktopBackup
+                BackupHash = $(if ($desktopBackup) { (Get-FileHash -LiteralPath $desktopBackup -Algorithm SHA256).Hash } else { '' })
+                ContentHash = $contentHash
+            }
+            Write-ZcFileBytes -Path $desktopPath -Bytes $contentBytes
         }
     } catch { }
 
@@ -888,7 +893,8 @@ try {
     }
 
     $tsIp = Get-TailscaleIp
-    if ($tsIp) { Write-AccessResult $tsIp $SiteName }
+    if (-not $tsIp) { throw 'Could not verify Tailscale IPv4. No ready result is claimed.' }
+    Write-AccessResult $tsIp $SiteName
 
     $script:Journal.Status = 'Applied'
     Save-SiteJournal
@@ -929,8 +935,11 @@ catch {
                 Write-Host 'Rolling back resources created by this run...' -ForegroundColor Yellow
                 $saved = Read-ZcJournal -Path (Get-ZcJournalPath -Root $script:StateRoot -RunId $script:RunId)
                 $undo = Invoke-ZcUndoJournal -Root $script:StateRoot -Journal $saved
-                $script:Journal.UndoResults = @($undo.Results)
-                if (@($undo.Errors).Count -eq 0) { $script:Journal.Status = 'RolledBack' } else { $script:Journal.Status = 'RollbackPartial' }
+                # Keep the undo helper's durable per-change progress; saving the
+                # stale pre-undo object would permit restored settings to replay.
+                $script:Journal = $saved
+                $applyStatus = $(if (@($undo.Errors).Count -eq 0) { 'RolledBack' } else { 'RollbackPartial' })
+                $script:Journal | Add-Member -NotePropertyName ApplyStatus -NotePropertyValue $applyStatus -Force
                 Save-SiteJournal
                 foreach ($item in @($undo.Results)) {
                     $color = $(if ($item.Status -eq 'Error') { 'Red' } else { 'Gray' })

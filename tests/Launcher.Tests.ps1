@@ -18,16 +18,17 @@ try {
     $sandbox = Join-Path $testRoot 'folder with spaces'
     New-Item -ItemType Directory -Path $sandbox | Out-Null
     [IO.File]::WriteAllText((Join-Path $sandbox 'run.ps1'), [IO.File]::ReadAllText((Join-Path $kit 'run.ps1'), [Text.Encoding]::UTF8), $utf8)
+    Copy-Item -LiteralPath (Join-Path $kit 'zc-config.ps1') -Destination (Join-Path $sandbox 'zc-config.ps1')
     $stub = @'
 param([string]$JumpHost,[string]$JumpUser,[string]$JumpPassword,[string]$Target,
 [string[]]$Forward,[string]$SiteName,[string]$ProfilePath,[switch]$VerifyOnly,
-[int]$DbPort,[int]$WebPort,[int]$RdpPort)
+[int]$DbPort,[int]$WebPort,[int]$RdpPort,[switch]$DirectOnly)
 $PSBoundParameters | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $PSScriptRoot 'received.json') -Encoding UTF8
 '@
     [IO.File]::WriteAllText((Join-Path $sandbox '02-connect-site.ps1'), $stub, $utf8)
     [IO.File]::WriteAllText((Join-Path $sandbox '01-jump-setup.ps1'), "throw 'Site engine must not run in these tests.'", $utf8)
     $fakePassword = 'SYNTHETIC "quoted" value with space and slash\'
-    $cfg = [ordered]@{authKey='';opsUser='fake_ops';opsPassword=$fakePassword;siteName='offline';jumpHost='100.64.0.10';targetServer='10.0.0.10';dbPort=13306;webPort=18080;rdpPort=13389;extraForwards=@('23389:10.0.0.20:3389','33389:10.0.0.30:3389');advertiseRoutes=@();profilePath=''}
+    $cfg = [ordered]@{authKey='';opsUser='fake_ops';opsPassword=$fakePassword;siteName='offline';jumpHost='100.64.0.10';targetServer='10.0.0.10';connectionMode='Forward';dbPort=13306;webPort=18080;rdpPort=13389;extraForwards=@('23389:10.0.0.20:3389','33389:10.0.0.30:3389');advertiseRoutes=@();profilePath=''}
     function Save-Config { [IO.File]::WriteAllText((Join-Path $sandbox 'config.json'), ($cfg | ConvertTo-Json -Depth 6), $utf8) }
     function Invoke-Case([string]$Flags, [bool]$ShouldPass) {
         $out = Join-Path $testRoot 'stdout.txt'; $err = Join-Path $testRoot 'stderr.txt'
@@ -67,6 +68,10 @@ $PSBoundParameters | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $PSScriptR
     $cfg.useOnlineInstaller = $true; Save-Config
     [IO.File]::WriteAllText((Join-Path $sandbox '01-jump-setup.ps1'), $stub01, $utf8)
     [IO.File]::WriteAllText((Join-Path $sandbox 'access-result.txt'), 'JumpHost=100.64.0.10', $utf8)
+    # An unchanged result from an earlier run cannot prove this run succeeded.
+    Invoke-Case '-Mode 1 -AllowExperimentalSiteSetup' $false; $passed++
+    $stub01 += "`r`n" + '[IO.File]::WriteAllText((Join-Path $PSScriptRoot ''access-result.txt''), (''JumpHost=100.64.0.10'' + [Environment]::NewLine + ''GeneratedBy=stub:'' + [guid]::NewGuid().ToString(''N'')))'
+    [IO.File]::WriteAllText((Join-Path $sandbox '01-jump-setup.ps1'), $stub01, $utf8)
     Invoke-Case '-Mode 1 -AllowExperimentalSiteSetup' $true
     $received01 = Get-Content (Join-Path $sandbox 'received01.json') -Raw -Encoding UTF8 | ConvertFrom-Json
     if (-not $received01.UseOnlineInstaller) { throw 'useOnlineInstaller from config did not reach the site engine.' }

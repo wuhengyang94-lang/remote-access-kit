@@ -52,6 +52,7 @@ param(
     [switch]$EnsureOnBoot,
     [switch]$NoVerify,
     [switch]$VerifyOnly,
+    [switch]$DirectOnly,
     [switch]$SkipSignatureCheck,
     [string]$SiteName,
     [string]$ProfilePath
@@ -70,6 +71,7 @@ if (-not (Test-Path -LiteralPath $stateLib)) {
     throw 'Kit incomplete: zc-state.ps1 is missing next to 02-connect-site.ps1.'
 }
 . $stateLib
+. (Join-Path $PSScriptRoot 'zc-process.ps1')
 
 function Assert-LocalInstallerTrusted([string]$Path) {
     if ($SkipSignatureCheck) {
@@ -145,20 +147,11 @@ function Ensure-LocalTailscale {
 function Ensure-TailscaleConnected {
     $backend = $null
     try {
-        $json = & $script:TsExe status --json 2>$null
-        if ($json) { $backend = ($json | ConvertFrom-Json).BackendState }
+        $result = Invoke-ZcNativeProcess -FilePath $script:TsExe -Arguments @('status','--json') -TimeoutSec 30
+        if ($result.ExitCode -eq 0 -and $result.Text) { $backend = ($result.Text | ConvertFrom-Json).BackendState }
     } catch { $backend = $null }
-
     if ($backend -ne 'Running') {
-        Write-Step 'bringing Tailscale up (unattended)...'
-        try { & $script:TsExe up --unattended *> $null } catch { }
-        try {
-            $json = & $script:TsExe status --json 2>$null
-            if ($json) { $backend = ($json | ConvertFrom-Json).BackendState }
-        } catch { $backend = $null }
-    }
-    if ($backend -ne 'Running') {
-        throw 'Tailscale is not connected. Open the Tailscale tray icon and log in, then re-run this script.'
+        throw 'Tailscale is not connected. Open the Tailscale tray icon, log in to the same tailnet and connect, then re-run this script. No hidden login is started.'
     }
     Write-Ok 'Tailscale connected.'
 }
@@ -477,7 +470,7 @@ function Assert-ChannelVerification {
 }
 
 function New-SiteProfile {
-    param([string]$Title, [string]$JumpHost, [string]$JumpUser, [object[]]$Items, [string]$RunId = '')
+    param([string]$Title, [string]$JumpHost, [string]$JumpUser, [object[]]$Items, [string]$RunId = '', [switch]$DirectOnly)
 
     $lines = @()
     $lines += '<!-- ZCodeRemoteAccess:RunId=' + $RunId + ' -->'
@@ -488,6 +481,14 @@ function New-SiteProfile {
     $lines += '## Link'
     $lines += "Local PC  <->  Tailscale  <->  jump host $JumpHost  (account $JumpUser)"
     $lines += ''
+    if ($DirectOnly) {
+        $lines += 'Mode: Direct PC access. WinRM remote command verified; no port forwarding was configured.'
+        $lines += ''
+        $lines += ('- Remote command: Invoke-Command -ComputerName {0} -Credential (Get-Credential {1}) -ScriptBlock {{ hostname }}' -f $JumpHost, $JumpUser)
+        $lines += ('- RDP address: {0}:3389 (only if Remote Desktop is already enabled on that PC).' -f $JumpHost)
+        $lines += '- This kit does not enable Remote Desktop or open its firewall rules.'
+        return ($lines -join "`r`n")
+    }
     $lines += '## Channels (portproxy on the jump host; effective firewall policy is not audited)'
     $lines += ''
     $lines += '| Listen | Connect to | Purpose |'
@@ -516,7 +517,8 @@ Write-Host '==============================================================' -For
 
 try {
     if ($Force -or $EnsureOnBoot) { throw '-Force and -EnsureOnBoot are disabled; no overrides or startup tasks are allowed.' }
-    if ($VerifyOnly -and -not $Target) { throw '-VerifyOnly requires an explicit -Target IPv4 address.' }
+    if ($DirectOnly -and ($Target -or $Forward.Count -or $Discover -or $NoVerify)) { throw '-DirectOnly cannot be combined with target mappings, discovery or skipped verification.' }
+    if ($VerifyOnly -and -not $DirectOnly -and -not $Target) { throw '-VerifyOnly requires an explicit -Target IPv4 address in forward mode.' }
     if ($VerifyOnly -and ($NoVerify -or $Discover)) { throw '-VerifyOnly cannot be combined with -NoVerify or -Discover.' }
     # Validate all explicitly supplied mappings before changing local prerequisites.
     $initialMappings = @(New-ForwardMappings -TargetAddress $Target -Extra $Forward -Db $DbPort -Web $WebPort -Rdp $RdpPort)
@@ -570,9 +572,12 @@ try {
         }
     }
     else { Write-Step 'VerifyOnly: existing TrustedHosts configuration is used without changes' }
-    if ($VerifyOnly) { $remoteName = 'VerifyOnly (existing configuration)' }
+    if ($VerifyOnly -and -not $DirectOnly) { $remoteName = 'VerifyOnly (existing configuration)' }
     else { $remoteName = Connect-JumpHost $JumpHost $cred }
 
+    $mappings = @()
+    $verificationFailures = @()
+    if (-not $DirectOnly) {
     Write-Step '4/7 discover candidate servers'
     $discovery = $null
     if ($Discover -or -not $Target) {
@@ -706,19 +711,18 @@ try {
         Write-Warn2 '7/7 UNVERIFIED: channel verification skipped (-NoVerify); no connectivity pass is claimed.'
     }
     Assert-ChannelVerification -Failures $verificationFailures
+    } else {
+        Write-Ok ("Direct remote command verified on {0}; no discovery, forwarding or remote firewall changes were made." -f $remoteName)
+    }
 
     $title = 'site'
     if ($SiteName) { $title = $SiteName }
-    $profile = New-SiteProfile -Title $title -JumpHost $JumpHost -JumpUser $JumpUser -Items $mappings -RunId $runId
+    $profile = New-SiteProfile -Title $title -JumpHost $JumpHost -JumpUser $JumpUser -Items $mappings -RunId $runId -DirectOnly:$DirectOnly
     if ($NoVerify) { $profile = "Verification: UNVERIFIED (channel probes were skipped).`r`n`r`n" + $profile }
     Write-Host ''
     Write-Host $profile
     if ($ProfilePath -and -not $VerifyOnly) {
-        Set-Content -Path $ProfilePath -Value $profile -Encoding UTF8
-        Add-ZcChange -Root $localRoot -Journal $localJournal -Kind 'file.profile' -Data @{
-            Path = $ProfilePath
-            Marker = ('ZCodeRemoteAccess:RunId=' + $runId)
-        } | Out-Null
+        Save-ZcProfile -Root $localRoot -Journal $localJournal -Path $ProfilePath -Content $profile -Marker ('ZCodeRemoteAccess:RunId=' + $runId) | Out-Null
         Write-Ok "profile saved: $ProfilePath"
     }
 
@@ -737,7 +741,7 @@ try {
     Write-Host "Jump host : $JumpHost ($remoteName)"
     Write-Host "Ops user  : $JumpUser"
     if ($runId) { Write-Host "Run ID    : $runId" }
-    Write-Host 'TCP OPEN checks frontend listeners only; verify backend application access separately.'
+    if (-not $DirectOnly) { Write-Host 'TCP OPEN checks frontend listeners only; verify backend application access separately.' }
     Write-Host "==============================================================$adminHint" -ForegroundColor Green
 }
 catch {
