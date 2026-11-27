@@ -22,20 +22,20 @@
     files without BOM.
 
 .PARAMETER JumpHost
-    Tailscale IPv4 (or MagicDNS name) of the jump host, e.g. 100.82.214.10
+    Tailscale IPv4 (or MagicDNS name) of the jump host, e.g. 100.64.0.10
 
 .PARAMETER Forward
-    Extra mapping "listen:host:port", e.g. 23389:10.4.76.200:3389
+    Extra mapping "listen:host:port", e.g. 23389:10.0.0.20:3389
 
 .PARAMETER VerifyOnly
     Requires Target. Makes no local setup/profile changes and only reads remote
     portproxy/listeners. Existing Tailscale, WinRM and trust must already work.
 
 .EXAMPLE
-    .\02-connect-site.ps1 -JumpHost 100.82.214.10 -Target 10.4.76.201 -SiteName baoding
+    .\02-connect-site.ps1 -JumpHost 100.64.0.10 -Target 10.0.0.10 -SiteName demo
 
 .EXAMPLE
-    .\02-connect-site.ps1 -JumpHost 100.82.214.10 -Forward 23389:10.4.76.200:3389
+    .\02-connect-site.ps1 -JumpHost 100.64.0.10 -Forward 23389:10.0.0.20:3389
 #>
 [CmdletBinding()]
 param(

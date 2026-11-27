@@ -20,7 +20,7 @@ $tmp = Join-Path $env:TEMP ('zcode-state-tests-' + [guid]::NewGuid().ToString('N
 $state = Initialize-ZcLocalStateRoot -Path $tmp
 $j = New-ZcJournal -Phase 'connect' -SiteName 'lab' -HostName $env:COMPUTERNAME -RunId 'connect-test-0001'
 Save-ZcJournal -Root $state -Journal $j | Out-Null
-Add-ZcChange -Root $state -Journal $j -Kind 'portproxy' -Data @{ ListenAddress = '0.0.0.0'; ListenPort = 13306; ConnectAddress = '10.4.76.201'; ConnectPort = 3306 } | Out-Null
+Add-ZcChange -Root $state -Journal $j -Kind 'portproxy' -Data @{ ListenAddress = '0.0.0.0'; ListenPort = 13306; ConnectAddress = '10.0.0.201'; ConnectPort = 3306 } | Out-Null
 $read = Read-ZcJournal -Path (Get-ZcJournalPath -Root $state -RunId 'connect-test-0001')
 Assert-True ($read.RunId -eq 'connect-test-0001' -and $read.Phase -eq 'connect') 'Journal identity must round-trip.'
 Assert-True (@($read.Changes).Count -eq 1 -and $read.Changes[0].Kind -eq 'portproxy') 'Journal change must round-trip.'
@@ -31,9 +31,9 @@ Assert-True ($none.Count -eq 0) 'Phase filter must exclude other phases.'
 $pass++
 
 # --- ownership predicates ---
-$change = [pscustomobject]@{ Data = [pscustomobject]@{ ListenAddress = '0.0.0.0'; ListenPort = 13306; ConnectAddress = '10.4.76.201'; ConnectPort = 3306 } }
-$row = [pscustomobject]@{ Address = '0.0.0.0'; Listen = 13306; Connect = '10.4.76.201'; Port = 3306 }
-$row2 = [pscustomobject]@{ Address = '0.0.0.0'; Listen = 13306; Connect = '10.4.76.202'; Port = 3306 }
+$change = [pscustomobject]@{ Data = [pscustomobject]@{ ListenAddress = '0.0.0.0'; ListenPort = 13306; ConnectAddress = '10.0.0.201'; ConnectPort = 3306 } }
+$row = [pscustomobject]@{ Address = '0.0.0.0'; Listen = 13306; Connect = '10.0.0.201'; Port = 3306 }
+$row2 = [pscustomobject]@{ Address = '0.0.0.0'; Listen = 13306; Connect = '10.0.0.202'; Port = 3306 }
 Assert-True (Test-ZcProxyOwned $row $change) 'Exact proxy must be owned.'
 Assert-True (-not (Test-ZcProxyOwned $row2 $change)) 'Changed proxy must not be owned.'
 $rule = [pscustomobject]@{ Description = 'x ZCodeRemoteAccess:run-1 y' }
@@ -58,8 +58,8 @@ $journal = [pscustomobject]@{
     HostName = $env:COMPUTERNAME; SiteName = 'lab'; CreatedUtc = (Get-Date).ToUniversalTime().ToString('o')
     UpdatedUtc = (Get-Date).ToUniversalTime().ToString('o'); Status = 'Applied'; Snapshot = [pscustomobject]@{}
     Changes = @(
-        [pscustomobject]@{ Kind = 'portproxy'; Data = [pscustomobject]@{ ListenAddress = '0.0.0.0'; ListenPort = 13306; ConnectAddress = '10.4.76.201'; ConnectPort = 3306 } },
-        [pscustomobject]@{ Kind = 'portproxy'; Data = [pscustomobject]@{ ListenAddress = '0.0.0.0'; ListenPort = 13307; ConnectAddress = '10.4.76.203'; ConnectPort = 3306 } },
+        [pscustomobject]@{ Kind = 'portproxy'; Data = [pscustomobject]@{ ListenAddress = '0.0.0.0'; ListenPort = 13306; ConnectAddress = '10.0.0.201'; ConnectPort = 3306 } },
+        [pscustomobject]@{ Kind = 'portproxy'; Data = [pscustomobject]@{ ListenAddress = '0.0.0.0'; ListenPort = 13307; ConnectAddress = '10.0.0.203'; ConnectPort = 3306 } },
         [pscustomobject]@{ Kind = 'firewall.rule'; Data = [pscustomobject]@{ Name = 'ZCode-Proxy-13306-good' } },
         [pscustomobject]@{ Kind = 'firewall.rule'; Data = [pscustomobject]@{ Name = 'ZCode-Proxy-13307-bad' } }
     )
@@ -69,8 +69,8 @@ Save-ZcJournal -Root $state -Journal $journal | Out-Null
 
 function Get-ZcProxyRows {
     return @(
-        [pscustomobject]@{ Address = '0.0.0.0'; Listen = 13306; Connect = '10.4.76.201'; Port = 3306 },
-        [pscustomobject]@{ Address = '0.0.0.0'; Listen = 13307; Connect = '10.4.76.202'; Port = 3306 }
+        [pscustomobject]@{ Address = '0.0.0.0'; Listen = 13306; Connect = '10.0.0.201'; Port = 3306 },
+        [pscustomobject]@{ Address = '0.0.0.0'; Listen = 13307; Connect = '10.0.0.202'; Port = 3306 }
     )
 }
 function Get-ZcFirewallRule([string]$Name) {
@@ -198,7 +198,7 @@ function Get-NetTCPConnection { [CmdletBinding()] param([string]$State) return @
 # journal writer remains testable without locking the test account out.
 function icacls.exe { $global:LASTEXITCODE = 0; return 'mocked' }
 $tmp02 = Join-Path $env:TEMP ('zcode-connect-journal-' + [guid]::NewGuid().ToString('N'))
-$mapping = [pscustomobject]@{ Listen = 13306; Connect = '10.4.76.201'; Port = 3306; Label = 'MySQL' }
+$mapping = [pscustomobject]@{ Listen = 13306; Connect = '10.0.0.201'; Port = 3306; Label = 'MySQL' }
 $json02 = ConvertTo-Json -InputObject @($mapping) -Compress
 $validation02 = ${function:Assert-ForwardMappings}.ToString()
 $result02 = @(& $body02 $json02 $false $validation02 'connect-journal-test' 'lab' $tmp02 $true)

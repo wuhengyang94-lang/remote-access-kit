@@ -25,10 +25,10 @@ function Assert-Throws([scriptblock]$Action, [string]$Pattern) {
     try { & $Action | Out-Null } catch { $message = $_.Exception.Message }
     Assert-True ($message -match $Pattern) "Expected error '$Pattern', got '$message'."
 }
-function New-Mapping([int]$Listen = 13306, [string]$Connect = '10.4.76.201', [int]$Port = 3306) {
+function New-Mapping([int]$Listen = 13306, [string]$Connect = '10.0.0.201', [int]$Port = 3306) {
     return [pscustomobject]@{ Listen = $Listen; Connect = $Connect; Port = $Port; Label = 'test' }
 }
-function New-Row([int]$Listen = 13306, [string]$Address = '0.0.0.0', [string]$Connect = '10.4.76.201', [int]$Port = 3306) {
+function New-Row([int]$Listen = 13306, [string]$Address = '0.0.0.0', [string]$Connect = '10.0.0.201', [int]$Port = 3306) {
     return [pscustomobject]@{ Listen = $Listen; Address = $Address; Connect = $Connect; Port = $Port }
 }
 function Reset-Fakes([object[]]$Rows = @(), [object[]]$Listeners = @()) {
@@ -67,7 +67,7 @@ function netsh.exe {
     [void]$script:Writes.Add($flat)
     if ($flat -like 'interface portproxy add v4tov4 *') {
         $target = $values.connectaddress
-        if ($script:BadReadback) { $target = '10.4.76.254' }
+        if ($script:BadReadback) { $target = '10.0.0.254' }
         $script:Rows += New-Row -Listen ([int]$values.listenport) -Address $values.listenaddress -Connect $target -Port ([int]$values.connectport)
     } elseif ($flat -like 'interface portproxy delete v4tov4 *') {
         $script:Rows = @($script:Rows | Where-Object { -not ($_.Listen -eq [int]$values.listenport -and $_.Address -eq $values.listenaddress) })
@@ -99,7 +99,7 @@ $result = @(Invoke-Offline @((New-Mapping)) $true)
 Assert-True ($result[0].Status -eq 'unchanged' -and $script:Writes.Count -eq 0) 'Wildcard display must normalize to unchanged.'
 $pass++
 
-Reset-Fakes -Rows @((New-Row -Connect '10.4.76.200'))
+Reset-Fakes -Rows @((New-Row -Connect '10.0.0.200'))
 Assert-Throws { Invoke-Offline @((New-Mapping)) } 'CONFLICT'
 Assert-True ($script:Writes.Count -eq 0) 'Different target must not write.'
 $pass++
@@ -109,12 +109,12 @@ Assert-Throws { Invoke-Offline @((New-Mapping)) } 'CONFLICT'
 Assert-True ($script:Writes.Count -eq 0) 'Different listen address must not write.'
 $pass++
 
-Reset-Fakes -Rows @((New-Row -Connect '10.4.76.200'))
+Reset-Fakes -Rows @((New-Row -Connect '10.0.0.200'))
 Assert-Throws { Invoke-Offline @((New-Mapping -Listen 23389), (New-Mapping)) } 'CONFLICT'
 Assert-True ($script:Writes.Count -eq 0) 'Whole batch must preflight before first write.'
 $pass++
 
-foreach ($mapping in @((New-Mapping -Connect '999.1.1.1'), (New-Mapping -Connect '10.4.76.01'), (New-Mapping -Listen 0), (New-Mapping -Listen 65536), (New-Mapping -Port 65536))) {
+foreach ($mapping in @((New-Mapping -Connect '999.1.1.1'), (New-Mapping -Connect '10.0.0.01'), (New-Mapping -Listen 0), (New-Mapping -Listen 65536), (New-Mapping -Port 65536))) {
     Reset-Fakes
     Assert-Throws { Invoke-Offline @($mapping) } 'IPv4|1\.\.65535'
     Assert-True ($script:Writes.Count -eq 0 -and $script:Reads -eq 0) 'Invalid input must fail before native commands.'
@@ -143,12 +143,12 @@ $pass++
 Reset-Fakes
 $result = @(Invoke-Offline @((New-Mapping)))
 Assert-True ($result[0].Status -eq 'created' -and $script:Writes.Count -eq 2 -and $script:Reads -ge 4) 'New mappings require checked creation and readback.'
-Assert-True ($script:Writes[0] -match 'connectaddress=10\.4\.76\.201 connectport=3306') 'Native arguments must contain property values, not member-access literals.'
+Assert-True ($script:Writes[0] -match 'connectaddress=10\.0\.0\.201 connectport=3306') 'Native arguments must contain property values, not member-access literals.'
 $pass++
 
 Reset-Fakes -Rows @((New-Row)) -Listeners @($listener)
 $script:FailOn = '^advfirewall firewall add'
-Assert-Throws { Invoke-Offline @((New-Mapping), (New-Mapping -Listen 23389 -Connect '10.4.76.200' -Port 3389)) } 'netsh failed \(exit 9\)'
+Assert-Throws { Invoke-Offline @((New-Mapping), (New-Mapping -Listen 23389 -Connect '10.0.0.200' -Port 3389)) } 'netsh failed \(exit 9\)'
 Assert-True ($script:Rows.Count -eq 1 -and $script:Rows[0].Listen -eq 13306) 'Rollback must preserve every original proxy.'
 Assert-True ($script:Firewalls.Count -eq 0) 'Rollback must remove only this invocation firewall.'
 Assert-True (@($script:Writes | Where-Object { $_ -match 'delete v4tov4.*listenport=13306' }).Count -eq 0) 'Rollback must never delete an unchanged proxy.'
@@ -160,14 +160,14 @@ Assert-Throws { Invoke-Offline @((New-Mapping), (New-Mapping -Listen 23389), (Ne
 Assert-True ($script:Rows.Count -eq 1 -and $script:Rows[0].Listen -eq 13306 -and $script:Firewalls.Count -eq 0) 'A later failure must roll back the entire new batch, preserving originals.'
 $pass++
 
-Reset-Fakes -Rows @((New-Row -Connect '@{Listen=13306; Connect=10.4.76.201}.Connect'))
+Reset-Fakes -Rows @((New-Row -Connect '@{Listen=13306; Connect=10.0.0.201}.Connect'))
 Assert-Throws { Invoke-Offline @((New-Mapping)) } 'CONFLICT'
 Assert-True ($script:Writes.Count -eq 0) 'Previously corrupted target text must never be treated as an absent rule.'
 $pass++
 
 Reset-Fakes -Rows @((New-Row)) -Listeners @($listener)
 $script:FailOn = '^interface portproxy add'
-Assert-Throws { Invoke-Offline @((New-Mapping), (New-Mapping -Listen 23389 -Connect '10.4.76.200' -Port 3389)) } 'netsh failed \(exit 9\)'
+Assert-Throws { Invoke-Offline @((New-Mapping), (New-Mapping -Listen 23389 -Connect '10.0.0.200' -Port 3389)) } 'netsh failed \(exit 9\)'
 Assert-True ($script:Rows.Count -eq 1 -and $script:Rows[0].Listen -eq 13306) 'Partially created proxy must roll back without touching original.'
 $pass++
 
@@ -186,6 +186,6 @@ $pass++
 Assert-Throws { Set-RemoteForwards -Mappings @((New-Mapping)) -ForceIt $true -EnsureOnBootIt $false } 'disabled'
 Assert-Throws { Set-RemoteForwards -Mappings @((New-Mapping)) -ForceIt $false -EnsureOnBootIt $true } 'disabled'
 $pass += 2
-Assert-Throws { New-ForwardMappings -TargetAddress '10.4.76.201' -Extra @('13306:10.4.76.200:3389') -Db 13306 -Web 18080 -Rdp 13389 } 'Duplicate'
+Assert-Throws { New-ForwardMappings -TargetAddress '10.0.0.201' -Extra @('13306:10.0.0.200:3389') -Db 13306 -Web 18080 -Rdp 13389 } 'Duplicate'
 $pass++
 Write-Host "PASS: $pass offline forwarding checks (PowerShell $($PSVersionTable.PSVersion)); no main, native executable, or remote connection executed."

@@ -6,8 +6,8 @@
 
 | 角色 | 机器 | 系统 | 说明 |
 |---|---|---|---|
-| A（本机） | 已在 tailnet 的主力机 | Windows | Tailscale CLI 可用，账号 `wuhengyang94@gmail.com` |
-| B（对端） | `FQ-CEPALGQATCXP`（笔记本） | Windows 10 22H2（10.0.19045.5965） | 全新机器，此前未入网；工具位于 `E:\remote-access-kit` |
+| A（本机） | 已在 tailnet 的主力机 | Windows | Tailscale CLI 可用，账号已隐去 |
+| B（对端） | 全新 Win10 笔记本（机器名已隐去） | Windows 10 22H2（10.0.19045.5965） | 全新机器，此前未入网；工具位于本地工具目录 |
 
 auth key 于当日经管理后台生成：Reusable、1 天有效期、非 Ephemeral、无 Tags。
 
@@ -25,11 +25,11 @@ B 端初始化细节：
 - 内置 MSI（tailscale 1.104.1）静默安装成功。
 - 入网时环境变量方式被拒（IPC 被占），引擎停止 IPN/GUI 后改用 `--authkey` 重试成功——JoinRetry 加固在现场首次真实触发并生效。
 - WinRM 以 Tailscale 范围规则启用；`zcode_ops` 入管理员组，`LocalAccountTokenFilterPolicy=1`。
-- 结果写入 `access-result.txt`，`config.json` 回填 `jumpHost=100.85.34.47`。现场名含中文（`Win10笔记本`），全程无异常。
+- 结果写入 `access-result.txt`，`config.json` 回填 `jumpHost=<B-IP>`。现场名含中文，全程无异常。
 
 A 端连接细节：
 
-- TrustedHosts 追加 `100.85.34.47`（保留既有条目，共 5 项）。
+- TrustedHosts 追加 `<B-IP>`（保留既有条目，共 5 项）。
 - WinRM 认证成功，远程命令 `hostname` 在 B 上验证通过；直连模式未做发现、转发或远端防火墙变更。
 - 档案写入 `site-profile-site.md`。
 - 隧道为 P2P 直连（未走中继），ping 约 377ms。
@@ -40,8 +40,8 @@ A 端连接细节：
 
 ## 验收后的后台设置
 
-- `fq-cepalgqatcxp` 节点密钥过期已禁用（详情页核实 `Expiry disabled`）。
-- MagicDNS：`fq-cepalgqatcxp.tail8bfb6f.ts.net`。
+- `<B-节点名>` 节点密钥过期已禁用（详情页核实 `Expiry disabled`）。
+- MagicDNS：`<节点名>.<tailnet>.ts.net`。
 - B 作为长期在用节点保留，撤销流程本次不执行。
 
 ## 未覆盖
